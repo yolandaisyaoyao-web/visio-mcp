@@ -13,6 +13,7 @@ COM collections are 1-based (Count/Item), matching how VisioClient iterates.
 from __future__ import annotations
 
 import os
+import re
 
 # A tiny valid 1x1 transparent PNG so export tests produce a real image file.
 PNG_1X1 = bytes.fromhex(
@@ -101,6 +102,59 @@ class FakeConnect:
         self.ToSheet = to_sheet
 
 
+_DIM_PLAIN_RE = re.compile(r"^\s*([0-9.]+)\s*(?:mm|in)?\s*$")
+_DIM_MUL_RE = re.compile(
+    r"^\s*(?:(Width|Height)(?:\s*\*\s*([0-9.]+))?|([0-9.]+)\s*\*\s*(Width|Height))\s*$"
+)
+
+
+class FakeConnPtCell:
+    """A Connection Points X/Y cell (visSectionConnectionPts).
+
+    FormulaU holds a local-coordinate formula such as 'Width*0.5' or
+    'Height'; ResultIU evaluates it live against the shape's current size,
+    mirroring how Visio recomputes connection points when Width/Height
+    change.
+    """
+
+    def __init__(self, shape, name, formula="0"):
+        self.shape = shape
+        self.Name = name
+        self._formula = str(formula)
+
+    @property
+    def FormulaU(self):
+        return self._formula
+
+    @FormulaU.setter
+    def FormulaU(self, value):
+        self._formula = str(value)
+
+    @property
+    def ResultIU(self):
+        plain = _DIM_PLAIN_RE.match(self._formula)
+        if plain:
+            return float(plain.group(1))
+        mul = _DIM_MUL_RE.match(self._formula)
+        if mul:
+            if mul.group(1):
+                factor = float(mul.group(2)) if mul.group(2) else 1.0
+                return float(self.shape.CellsU(mul.group(1)).ResultIU) * factor
+            return float(self.shape.CellsU(mul.group(4)).ResultIU) * float(mul.group(3))
+        return 0.0
+
+
+class FakeConnPt:
+    """One row of the Connection Points section (X and Y cells)."""
+
+    def __init__(self, shape, index, x_formula="0", y_formula="0"):
+        self.x = FakeConnPtCell(shape, f"Connections.X{index}", x_formula)
+        self.y = FakeConnPtCell(shape, f"Connections.Y{index}", y_formula)
+
+    def cell(self, column):
+        return self.x if int(column) == 0 else self.y
+
+
 class FakeLocPinCell:
     """LocPin defaults to the shape center via formula in real Visio: track
     Width/Height unless explicitly overridden."""
@@ -146,6 +200,7 @@ class FakeShape:
         self.OneD = 0
         self.connects: list[FakeConnect] = []
         self.member_of: list[int] = []
+        self.conn_pts: list[FakeConnPt] = []
         self.ContainerProperties = None
         self._cells: dict[str, FakeCell] = {}
         self.CellsU("PinX").ResultIU = x
@@ -160,6 +215,25 @@ class FakeShape:
             else:
                 self._cells[name] = FakeCell(self, name)
         return self._cells[name]
+
+    # -- Connection Points section (section 7) ------------------------------
+
+    def RowCount(self, section):
+        return len(self.conn_pts) if int(section) == 7 else 0
+
+    def CellsSRC(self, section, row, column):
+        if int(section) != 7:
+            raise com_error(-2147352567, f"section {section} not modeled")
+        row = int(row)
+        if not 0 <= row < len(self.conn_pts):
+            raise com_error(-2147352567, f"no connection point row {row}")
+        return self.conn_pts[row].cell(column)
+
+    def AddRow(self, section, row, tag):
+        if int(section) != 7:
+            raise com_error(-2147352567, f"AddRow not modeled for section {section}")
+        self.conn_pts.append(FakeConnPt(self, len(self.conn_pts) + 1))
+        return len(self.conn_pts) - 1
 
     @property
     def Connects(self):
@@ -178,9 +252,12 @@ class FakeShape:
 
 
 class FakeMaster:
-    def __init__(self, name):
+    def __init__(self, name, conn_points=None):
         self.Name = name
         self.NameU = name
+        # [(x_formula, y_formula)] for the Connection Points section; each
+        # dropped instance gets its own copy (row order is master-specific).
+        self.conn_points = list(conn_points or [])
 
 
 class FakePageSheet:
@@ -227,6 +304,11 @@ class FakePage:
         if isinstance(master_or_dataobject, FakeMaster):
             shape.Master = master_or_dataobject
             shape.NameU = f"{master_or_dataobject.NameU}.{shape.ID}"
+            for x_formula, y_formula in master_or_dataobject.conn_points:
+                index = len(shape.conn_pts) + 1
+                shape.conn_pts.append(
+                    FakeConnPt(shape, index, x_formula, y_formula)
+                )
             if getattr(master_or_dataobject, "is_container", False):
                 shape.ContainerProperties = FakeContainerProperties(shape)
         else:  # ConnectorToolDataObject
@@ -359,8 +441,15 @@ class FakeDocuments:
                 return d
         doc = FakeDocument(self._app, base, doc_type=2, path=os.path.dirname(name))
         is_container_stencil = "container" in base.lower()
+        # Visio's flowchart masters carry the four side-midpoint connection
+        # points; the row order matches its Process master (L/R/B/T).
+        default_points = [
+            ("0", "Height*0.5"), ("Width", "Height*0.5"),
+            ("Width*0.5", "0"), ("Width*0.5", "Height"),
+        ] if "BASFLO" in base.upper() else []
         for master_name in stencil_masters:
-            master = FakeMaster(master_name)
+            points = self._app.known_master_points.get(master_name, default_points)
+            master = FakeMaster(master_name, conn_points=points)
             master.is_container = is_container_stencil
             doc.Masters.append(master)
         self._coll.append(doc)
@@ -388,6 +477,8 @@ class FakeApplication:
             "BASFLO_U.VSSX": ["Process", "Decision", "Start/End", "Document", "Data"],
             "CONTAINER_U.VSSX": ["Plain", "Container 1", "Container 2"],
         }
+        # per-master Connection Points rows: {master_name: [(x_formula, y_formula)]}
+        self.known_master_points: dict[str, list[tuple[str, str]]] = {}
 
     def GetBuiltInStencilFile(self, stencil_type, measurement):
         if stencil_type == 2:  # visBuiltInStencilContainers

@@ -680,6 +680,49 @@ class VisioClient:
 
     # -- connectors -----------------------------------------------------------
 
+    def _side_connection_cell(self, shape, side: str):
+        """The Connection Points cell at the midpoint of `side`.
+
+        Explicit sides pin the connector with static glue to this point —
+        dynamic glue (side='auto') lets Visio choose sides from the geometry
+        and cannot be directed through Cell.GlueTo. Row order in the
+        Connection Points section differs between masters (BASFLO's Process
+        stores left/right/bottom/top, Decision left/right/top/bottom and
+        Start/End bottom/top/left/right), so rows are matched by their local
+        X/Y coordinates, never by index. Shapes without a point on that side
+        (e.g. imported icons) get one created at the side midpoint.
+        """
+        width = float(shape.CellsU("Width").ResultIU)
+        height = float(shape.CellsU("Height").ResultIU)
+        target_x, target_y = {
+            "left": (0.0, height / 2.0),
+            "right": (width, height / 2.0),
+            "bottom": (width / 2.0, 0.0),
+            "top": (width / 2.0, height),
+        }[side]
+
+        section = C.VIS_SECTION_CONNECTION_PTS
+        for row in range(int(shape.RowCount(section))):
+            x = float(shape.CellsSRC(section, row, C.VIS_CNNCT_X).ResultIU)
+            y = float(shape.CellsSRC(section, row, C.VIS_CNNCT_Y).ResultIU)
+            if (abs(x - target_x) <= C.SIDE_POINT_TOLERANCE_IN
+                    and abs(y - target_y) <= C.SIDE_POINT_TOLERANCE_IN):
+                return shape.CellsSRC(section, row, C.VIS_CNNCT_X)
+
+        x_formula, y_formula = C.SIDE_POINT_FORMULAS[side]
+        row = int(shape.AddRow(section, C.VIS_ROW_LAST, C.VIS_TAG_DEFAULT))
+        x_cell = shape.CellsSRC(section, row, C.VIS_CNNCT_X)
+        shape.CellsSRC(section, row, C.VIS_CNNCT_Y).FormulaU = y_formula
+        x_cell.FormulaU = x_formula
+        return x_cell
+
+    def _glue_target(self, shape, side: str):
+        """Cell a connector endpoint is glued to: PinX for dynamic glue
+        ('auto'), a side connection point for a pinned side."""
+        if side == "auto":
+            return shape.CellsU("PinX")
+        return self._side_connection_cell(shape, side)
+
     def connect_shapes(
         self,
         from_id: int,
@@ -692,6 +735,8 @@ class VisioClient:
         line_pattern: str = "solid",
         line_weight_pt: Optional[float] = None,
         line_color: Optional[str] = None,
+        from_side: str = "auto",
+        to_side: str = "auto",
     ) -> dict:
         if route not in C.CONNECTOR_ROUTES:
             raise VisioMcpError(
@@ -701,6 +746,11 @@ class VisioClient:
             raise VisioMcpError(
                 f"line_pattern must be one of {sorted(C.LINE_PATTERNS)}, got {line_pattern!r}"
             )
+        for arg_name, side in (("from_side", from_side), ("to_side", to_side)):
+            if side not in C.CONNECTOR_SIDES:
+                raise VisioMcpError(
+                    f"{arg_name} must be one of {list(C.CONNECTOR_SIDES)}, got {side!r}"
+                )
         app = self._app()
         page = self._page(page_name)
         shape_from = self._shape_by_id(page, from_id)
@@ -708,10 +758,12 @@ class VisioClient:
 
         def _connect():
             conn = page.Drop(app.ConnectorToolDataObject, 0.0, 0.0)
-            # Gluing to PinX = dynamic glue: Visio picks the best sides and
-            # re-routes as the layout changes.
-            conn.CellsU("BeginX").GlueTo(shape_from.CellsU("PinX"))
-            conn.CellsU("EndX").GlueTo(shape_to.CellsU("PinX"))
+            # 'auto' glues to PinX = dynamic glue: Visio picks the best sides
+            # and re-routes as the layout changes. A pinned side glues to that
+            # side's connection point instead (static glue): the endpoint
+            # follows its shape and re-routes, but keeps the chosen side.
+            conn.CellsU("BeginX").GlueTo(self._glue_target(shape_from, from_side))
+            conn.CellsU("EndX").GlueTo(self._glue_target(shape_to, to_side))
             route_style, route_ext = C.CONNECTOR_ROUTES[route]
             conn.CellsU("ShapeRouteStyle").ResultIU = route_style
             conn.CellsU("ConLineRouteExt").ResultIU = route_ext
@@ -737,6 +789,8 @@ class VisioClient:
             "from_id": from_id,
             "to_id": to_id,
             "route": route,
+            "from_side": from_side,
+            "to_side": to_side,
         }
 
     # -- pages ----------------------------------------------------------------

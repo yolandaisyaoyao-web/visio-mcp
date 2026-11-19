@@ -41,7 +41,11 @@ mcp = FastMCP(
         "innermost containers first — and badge a zone with its header icon "
         "via badge_container (deterministic corner placement; the badge moves "
         "with the zone). Use drop_text for titles and legends, and dashed "
-        "connectors (line_pattern) for control-plane/auth flows. For Azure/"
+        "connectors (line_pattern) for control-plane/auth flows. Pin "
+        "connector endpoints with connect_shapes from_side/to_side "
+        "(auto/top/bottom/left/right) for loop-backs and branches — e.g. "
+        "loop back with right->right so the line doesn't wrap around shapes. "
+        "For Azure/"
         "AWS icons, Visio ships built-in cloud stencils — visio_status lists "
         "them in builtin_cloud_stencils and they open by bare filename (e.g. "
         "open_stencil('AZURESTORAGE_U.VSSX')); extra vendor packs can go in "
@@ -346,9 +350,14 @@ async def connect_shapes(
     line_weight_pt: Optional[float] = None,
     line_color: Optional[str] = None,
     page: Optional[str] = None,
+    from_side: Literal["auto", "top", "bottom", "left", "right"] = "auto",
+    to_side: Literal["auto", "top", "bottom", "left", "right"] = "auto",
 ) -> dict:
-    """Connect two shapes with a dynamic connector glued to both (Visio
-    auto-picks the best sides and re-routes when shapes move).
+    """Connect two shapes with a connector glued to both. With the default
+    from_side='auto' / to_side='auto' the connector uses Visio's dynamic glue:
+    Visio picks the best sides and re-routes when shapes move. Pass a side to
+    pin an endpoint deterministically — use it for loop-backs, decision
+    branches and parallel edges so lines don't wrap around or overlap.
 
     Args:
         label: Optional text on the connector (e.g. 'Yes' / 'No').
@@ -357,10 +366,17 @@ async def connect_shapes(
             auth, or reference flows in architecture diagrams.
         line_weight_pt: Thicker lines (e.g. 2) suit peering/trust boundaries.
         line_color: Hex like '#808080'.
+        from_side: 'auto' (dynamic glue), or 'top'/'bottom'/'left'/'right' to
+            attach the connector's begin to the midpoint of that side.
+            A pinned endpoint follows its shape when it moves but keeps the
+            chosen side — typical for a loop-back (right -> right) or a
+            decision's Yes/No branches.
+        to_side: Same for the arrowhead end at to_id.
     """
     return await _worker.run(
         _client.connect_shapes, from_id, to_id, label, route,
         end_arrow, begin_arrow, page, line_pattern, line_weight_pt, line_color,
+        from_side, to_side,
     )
 
 

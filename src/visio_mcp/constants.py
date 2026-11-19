@@ -180,3 +180,31 @@ CONNECTOR_ROUTES: dict[str, tuple[int, int]] = {
     "straight": (ROUTE_CENTER_TO_CENTER, ROUTE_EXT_STRAIGHT),
     "curved": (ROUTE_RIGHT_ANGLE, ROUTE_EXT_NURBS),
 }
+
+# --- Connector endpoint sides (connect_shapes from_side / to_side) ---------
+# 'auto' keeps Visio's dynamic glue (it re-picks the best side as shapes
+# move). The other values pin the endpoint with static glue to the shape's
+# connection point at the midpoint of that side.
+CONNECTOR_SIDES: tuple[str, ...] = ("auto", "top", "bottom", "left", "right")
+
+# Side -> (X formula, Y formula) for a point at the midpoint of that side in
+# the shape's local coordinates (0..Width, 0..Height).
+SIDE_POINT_FORMULAS: dict[str, tuple[str, str]] = {
+    "left": ("0", "Height*0.5"),
+    "right": ("Width", "Height*0.5"),
+    "bottom": ("Width*0.5", "0"),
+    "top": ("Width*0.5", "Height"),
+}
+
+# --- Connection Points ShapeSheet section (cells are addressed by
+#     Shape.CellsSRC(section, row, column)) ---------------------------------
+# The row order is master-specific (BASFLO stores Process = L/R/B/T,
+# Decision = L/R/T/B, Start/End = B/T/L/R), so a side is matched by the
+# point's local X/Y coordinates, never by its row index.
+VIS_SECTION_CONNECTION_PTS = 7
+VIS_CNNCT_X = 0
+VIS_CNNCT_Y = 1
+VIS_ROW_LAST = -2          # AddRow: append after the last row
+VIS_TAG_DEFAULT = 0        # AddRow row tag accepted by the Connection Points
+                           # section (visTagCnnctPt is rejected by Visio 16)
+SIDE_POINT_TOLERANCE_IN = 0.01  # how close a point must be to the side midpoint

@@ -73,6 +73,17 @@ async def test_connect_shapes_line_pattern_enum():
     ]
 
 
+async def test_connect_shapes_side_enums():
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    schema = tools["connect_shapes"].inputSchema
+    expected = ["auto", "top", "bottom", "left", "right"]
+    assert schema["properties"]["from_side"]["enum"] == expected
+    assert schema["properties"]["to_side"]["enum"] == expected
+    # new parameters default to auto, so existing callers are unaffected
+    assert schema["properties"]["from_side"].get("default") == "auto"
+    assert schema["properties"]["to_side"].get("default") == "auto"
+
+
 async def test_add_container_requires_label_and_members():
     tools = {t.name: t for t in await server.mcp.list_tools()}
     schema = tools["add_container"].inputSchema

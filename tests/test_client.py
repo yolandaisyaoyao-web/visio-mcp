@@ -198,6 +198,102 @@ def test_connect_unknown_route_rejected(client):
         client.connect_shapes(1, 2, route="zigzag")
 
 
+def test_connect_default_sides_keep_dynamic_glue(client, app):
+    _build_flowchart(client)
+    result = client.connect_shapes(1, 2)
+    conn = app.ActivePage.shapes[-1]
+    assert (result["from_side"], result["to_side"]) == ("auto", "auto")
+    assert app.ActivePage.glue_log == [
+        (conn.ID, "BeginX", 1, "PinX"),
+        (conn.ID, "EndX", 2, "PinX"),
+    ]
+
+
+def test_connect_pins_sides_to_connection_points(client, app):
+    _build_flowchart(client)
+    result = client.connect_shapes(1, 2, from_side="bottom", to_side="top")
+    conn = app.ActivePage.shapes[-1]
+    assert (result["from_side"], result["to_side"]) == ("bottom", "top")
+    # BASFLO master rows are left, right, bottom, top
+    assert app.ActivePage.glue_log == [
+        (conn.ID, "BeginX", 1, "Connections.X3"),
+        (conn.ID, "EndX", 2, "Connections.X4"),
+    ]
+    # routing and arrow settings still apply to side-pinned connectors
+    assert conn.CellsU("ShapeRouteStyle").ResultIU == C.ROUTE_RIGHT_ANGLE
+    assert conn.CellsU("EndArrow").FormulaU == "5"
+
+
+def test_connect_side_matching_uses_coordinates_not_row_order(client, app):
+    # Decision-style masters store their points left, right, top, bottom —
+    # a different row order than Process. 'bottom' must still resolve to the
+    # point at (Width*0.5, 0), i.e. the fourth row here.
+    app.known_master_points["Decision"] = [
+        ("0", "Height*0.5"),
+        ("Width", "Height*0.5"),
+        ("Width*0.5", "Height"),
+        ("Width*0.5", "0"),
+    ]
+    _build_flowchart(client)
+    client.connect_shapes(2, 3, to_side="bottom")
+    conn = app.ActivePage.shapes[-1]
+    assert app.ActivePage.glue_log[-1] == (conn.ID, "EndX", 3, "Connections.X4")
+    client.connect_shapes(2, 3, to_side="top")
+    conn = app.ActivePage.shapes[-1]
+    assert app.ActivePage.glue_log[-1] == (conn.ID, "EndX", 3, "Connections.X3")
+
+
+def test_connect_side_creates_missing_connection_point(client, app):
+    app.known_master_points["Process"] = []  # e.g. a shape imported from an icon
+    _build_flowchart(client)
+    shape = app.ActivePage.shapes[1]  # Process (start/end at index 0)
+    assert shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 0
+    client.connect_shapes(2, 1, from_side="right")
+    assert shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 1
+    point = shape.conn_pts[0]
+    assert point.x.FormulaU == "Width"
+    assert point.y.FormulaU == "Height*0.5"
+    assert app.ActivePage.glue_log[0] == (app.ActivePage.shapes[-1].ID, "BeginX", 2,
+                                          "Connections.X1")
+    # the same side is reused (matched by coordinates) on the next connect,
+    # even after the shape is resized
+    shape.CellsU("Width").ResultIU = 2.0
+    client.connect_shapes(2, 1, from_side="right")
+    assert shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 1
+
+
+def test_connect_mixed_side_and_auto(client, app):
+    _build_flowchart(client)
+    client.connect_shapes(1, 2, from_side="left")
+    conn = app.ActivePage.shapes[-1]
+    assert app.ActivePage.glue_log == [
+        (conn.ID, "BeginX", 1, "Connections.X1"),
+        (conn.ID, "EndX", 2, "PinX"),
+    ]
+
+
+def test_connect_side_on_imported_image(client, app, tmp_path):
+    client.create_document()
+    client.open_stencil("BASFLO_U.VSSX")
+    icon = tmp_path / "icon.svg"
+    icon.write_text("<svg xmlns='http://www.w3.org/2000/svg'/>")
+    img = client.import_image(str(icon), x=5, y=6, width_in=0.5)
+    proc = client.drop_shapes([{"master": "Process", "x": 5, "y": 4}])["shapes"][0]
+    client.connect_shapes(img["shape_id"], proc["shape_id"], from_side="bottom")
+    image_shape = app.ActivePage.Shapes.ItemFromID(img["shape_id"])
+    assert image_shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 1
+    assert image_shape.conn_pts[0].x.FormulaU == "Width*0.5"
+    assert image_shape.conn_pts[0].y.FormulaU == "0"
+
+
+def test_connect_rejects_unknown_side(client):
+    _build_flowchart(client)
+    with pytest.raises(VisioMcpError, match="from_side"):
+        client.connect_shapes(1, 2, from_side="middle")
+    with pytest.raises(VisioMcpError, match="to_side"):
+        client.connect_shapes(1, 2, to_side="diagonal")
+
+
 def test_style_shape_sets_formulas(client, app):
     _build_flowchart(client)
     client.style_shape(2, fill_color="#0078D4", line_color="#004578",
