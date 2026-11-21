@@ -80,17 +80,17 @@ Then ask Claude something like: *"Draw a 5-step login flowchart in Visio and sho
 | `find_masters` | Search droppable shapes across open stencils |
 | `drop_shape` / `drop_shapes` | Drop masters at (x, y) inches with optional text/size |
 | `update_shape` / `style_shape` / `delete_shapes` | Edit text/position/size, colors/fonts, delete |
-| `connect_shapes` | Glued connector: label, arrows, right-angle/straight/curved routing, solid/dashed/dotted patterns, weight, color, and optional `from_side`/`to_side` (`auto`/`top`/`bottom`/`left`/`right`) to pin endpoints for loop-backs and branches |
+| `connect_shapes` | Glued connector: label, arrows, right-angle/straight/curved routing, solid/dashed/dotted patterns, weight, color, optional `from_side`/`to_side` (`auto`/`top`/`bottom`/`left`/`right`) to pin endpoints for loop-backs and branches, and `from_pos`/`to_pos` (0..1) for the exact point along an edge (auto-spaced when omitted) |
 | `add_container` / `container_members` | Wrap shapes in real Visio containers (VNets, VPCs, subnets, trust zones) — members move with the container |
 | `drop_text` | Text-only labels (no border/fill) for titles, legends, and callouts |
 | `set_page_size` | Resize the page (or fit to contents) — do this before wide architecture diagrams |
 | `pages` | List/add/activate pages |
 | `auto_layout` | Visio's automatic layout (flowchart top-bottom/left-right, tree, radial, circular) |
-| `get_page_state` | Everything on a page: ids, masters, positions, text, connector endpoints, container membership |
+| `get_page_state` | Everything on a page: ids, masters, positions, text, connector endpoints and their glue (dynamic/static, edge, position along it, connection-point row), container membership |
 
 **Coordinate system**: inches, origin at the page **bottom-left**, y grows upward, and drop coordinates are the shape's **center**. Rough placement is fine — finish with `auto_layout`. The default page is US Letter (8.5×11): call `set_page_size` first for wide architecture diagrams, since PNG export crops to the page bounds.
 
-**Connector endpoints**: `connect_shapes` uses Visio's dynamic glue by default (`from_side`/`to_side` = `auto`), so Visio re-picks the best sides as shapes move. For algorithm flowcharts, pin the sides of loop-back and multi-branch edges so lines don't wrap around shapes or overlap: e.g. `connect_shapes(loop_id, cond_id, from_side="right", to_side="right")` keeps a clean loop on the right. A pinned endpoint still follows its shape and re-routes when the page layout changes — it just keeps the chosen side.
+**Connector endpoints**: `connect_shapes` uses Visio's dynamic glue by default (`from_side`/`to_side` = `auto`), so Visio re-picks the best sides as shapes move. For algorithm flowcharts, pin the sides of loop-back and multi-branch edges so lines don't wrap around shapes or overlap: e.g. `connect_shapes(loop_id, cond_id, from_side="right", to_side="right")` keeps a clean loop on the right. When several connectors share one edge, each new endpoint is auto-slotted into the widest free gap (the first uses the midpoint), so exits stay apart; pass `from_pos`/`to_pos` (0..1 along the edge; left/right run bottom→top, top/bottom run left→right) to place one exactly. A pinned endpoint still follows its shape and re-routes when the page layout changes — it keeps the chosen edge and position. `get_page_state` reports each connector end's glue kind, edge, position and connection-point row.
 
 ## Architecture
 

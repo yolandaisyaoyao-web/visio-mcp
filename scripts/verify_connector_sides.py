@@ -9,8 +9,11 @@ checks that:
   - pinned endpoints statically glue to the connection point on the
     requested side (formula references Connections.X, ToPart >= 100),
   - default 'auto' endpoints stay dynamically glued (_WALKGLUE, ToPart 3),
-  - endpoints stay on their pinned sides after a shape moves — including a
-    loop-back pinned right -> right — and after auto_layout,
+  - several connectors on one edge get distinct auto-slotted positions
+    (loop-back and the decision's No branch), and explicit from_pos works,
+  - endpoints stay on their pinned edge/position after a shape moves and
+    after auto_layout,
+  - get_page_state reports glue kind, edge, position and point row,
   - an imported icon with no connection points gets a side point created,
   - glue survives save + reopen of the .vsdx,
   - the routed page still exports as a PNG (open it and eyeball the result).
@@ -142,10 +145,12 @@ def run_checks(client: VisioClient) -> dict:
         def shape(shape_id):
             return page.Shapes.ItemFromID(int(shape_id))
 
-        def connect(src, dst, from_side, to_side, label=None):
+        def connect(src, dst, from_side, to_side, label=None,
+                    from_pos=None, to_pos=None):
             return client.connect_shapes(
-                src, dst, label, "right_angle", True, False, None,
-                "solid", None, None, from_side, to_side,
+                src, dst, label=label, route="right_angle",
+                from_side=from_side, to_side=to_side,
+                from_pos=from_pos, to_pos=to_pos,
             )
 
         print("[1] connections: pinned flow + auto probe")
@@ -154,6 +159,8 @@ def run_checks(client: VisioClient) -> dict:
             "init": connect(init, cond, "bottom", "top"),
             "yes": connect(cond, body, "bottom", "top", "Y"),
             "body": connect(body, incr, "bottom", "top"),
+            # the loop-back occupies the decision's right midpoint first; the
+            # No branch on the same edge must not share it
             "loop": connect(incr, cond, "right", "right"),
             "no": connect(cond, end, "right", "left", "N"),
             "auto": client.connect_shapes(auto_a, auto_b),
@@ -174,45 +181,80 @@ def run_checks(client: VisioClient) -> dict:
               and end_part(conn["auto"], False) == 3,
               "auto: ToPart == 3 (PinX dynamic glue)")
 
-        def mid_y(box):
-            return (box[1] + box[3]) / 2
-
-        def mid_x(box):
-            return (box[0] + box[2]) / 2
+        def side_point(box, side, pos):
+            """Page coordinate of `pos` along `side` of a bbox."""
+            if side in ("left", "right"):
+                x = box[0] if side == "left" else box[2]
+                return (x, box[1] + (box[3] - box[1]) * pos)
+            y = box[1] if side == "bottom" else box[3]
+            return (box[0] + (box[2] - box[0]) * pos, y)
 
         incr_box = bbox(shape(incr))
         cond_box = bbox(shape(cond))
         end_box = bbox(shape(end))
-        check(near(endpoint(conn["loop"], True), (incr_box[2], mid_y(incr_box))),
-              "loop: begin sits at i++'s right side midpoint")
-        check(near(endpoint(conn["loop"], False), (cond_box[2], mid_y(cond_box))),
-              "loop: end sits at the decision's right side midpoint")
-        check(near(endpoint(conn["no"], True), (cond_box[2], mid_y(cond_box))),
-              "no: begin sits at the decision's right side midpoint")
-        check(near(endpoint(conn["no"], False), (end_box[0], mid_y(end_box))),
-              "no: end sits at the end shape's left side midpoint")
+        check(near(endpoint(conn["loop"], True), side_point(incr_box, "right", 0.5)),
+              "loop: begin sits at i++'s right edge midpoint")
+        check(near(endpoint(conn["loop"], False), side_point(cond_box, "right", 0.5)),
+              "loop: end sits at the decision's right edge midpoint")
+        check(near(endpoint(conn["no"], True), side_point(cond_box, "right", 0.3)),
+              "no: second connector on that edge auto-slotted at pos 0.3")
+        check(near(endpoint(conn["no"], False), side_point(end_box, "left", 0.5)),
+              "no: end sits at the end shape's left edge midpoint")
+        loop_end = endpoint(conn["loop"], False)
+        no_begin = endpoint(conn["no"], True)
+        check(abs(loop_end[1] - no_begin[1]) > 0.1,
+              "two branches on the decision's right edge leave from distinct points")
+        check(abs(conns["loop"]["to_pos"] - 0.5) < 1e-6
+              and abs(conns["no"]["from_pos"] - 0.3) < 1e-6,
+              "connect_shapes returns the resolved edge positions")
 
-        print("[3] move a node: pinned ends follow their side")
+        print("[3] get_page_state reports glue kind, edge and point")
+        state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+        loop_state = state[conns["loop"]["connector_id"]]
+        no_state = state[conns["no"]["connector_id"]]
+        check(loop_state["to_glue"] == "static" and loop_state["to_side"] == "right"
+              and abs(loop_state["to_pos"] - 0.5) < 1e-6,
+              "get_page_state: loop end -> static right edge @ 0.5")
+        check(no_state["from_glue"] == "static" and no_state["from_side"] == "right"
+              and abs(no_state["from_pos"] - 0.3) < 1e-6,
+              "get_page_state: No branch begin -> static right edge @ 0.3")
+        check(no_state["from_point"] != loop_state["to_point"],
+              "the two connectors use different connection-point rows")
+        auto_state = state[conns["auto"]["connector_id"]]
+        check(auto_state["from_glue"] == "dynamic"
+              and auto_state["to_glue"] == "dynamic"
+              and auto_state["from_side"] is None
+              and auto_state["from_pos"] is None,
+              "get_page_state: auto connector -> dynamic glue, no fixed edge")
+
+        print("[4] move a node: pinned edge positions follow")
         shape(incr).CellsU("PinX").ResultIU = 6.0
         shape(incr).CellsU("PinY").ResultIU = 2.6
         incr_box = bbox(shape(incr))
-        check(near(endpoint(conn["loop"], True), (incr_box[2], mid_y(incr_box))),
-              "loop: begin still on i++'s right side after the move")
-        check(near(endpoint(conn["body"], False), (mid_x(incr_box), incr_box[3])),
-              "body: end still on i++'s top side after the move")
+        cond_box = bbox(shape(cond))
+        check(near(endpoint(conn["loop"], True), side_point(incr_box, "right", 0.5)),
+              "loop: begin still on i++'s right edge midpoint after the move")
+        check(near(endpoint(conn["body"], False), side_point(incr_box, "top", 0.5)),
+              "body: end still on i++'s top edge midpoint after the move")
+        check(near(endpoint(conn["no"], True), side_point(cond_box, "right", 0.3)),
+              "no: 0.3 slot kept on the decision's right edge after the move")
         before_auto = endpoint(conn["auto"], False)
         shape(auto_b).CellsU("PinX").ResultIU = 11.0
         shape(auto_b).CellsU("PinY").ResultIU = 8.0
         check(not near(before_auto, endpoint(conn["auto"], False)),
               "auto: dynamic end re-walked to a new side after the move")
 
-        print("[4] auto_layout keeps pinned sides")
+        print("[5] auto_layout keeps pinned edge positions")
         client.auto_layout("flowchart_tb", 0.6, True)
         incr_box = bbox(shape(incr))
-        check(near(endpoint(conn["loop"], True), (incr_box[2], mid_y(incr_box))),
-              "loop: begin stays on i++'s right side after auto_layout")
+        cond_box = bbox(shape(cond))
+        check(near(endpoint(conn["loop"], True), side_point(incr_box, "right", 0.5)),
+              "loop: begin stays at i++'s right edge midpoint after auto_layout")
+        check(near(endpoint(conn["loop"], False), side_point(cond_box, "right", 0.5))
+              and near(endpoint(conn["no"], True), side_point(cond_box, "right", 0.3)),
+              "both right-edge slots survive auto_layout")
 
-        print("[5] imported icon (no connection points) gets a side point")
+        print("[6] imported icon: explicit pos + auto point creation")
         icon_path = os.path.join(tmp, "connector_sides_icon.svg")
         with open(icon_path, "w", encoding="utf-8") as fh:
             fh.write('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">'
@@ -222,8 +264,8 @@ def run_checks(client: VisioClient) -> dict:
         check(int(icon_shape.RowCount(7)) == 0,
               "imported icon starts with no connection points")
         icon_conn = client.connect_shapes(
-            icon["shape_id"], auto_a, None, "right_angle", True, False, None,
-            "solid", None, None, "bottom", "top",
+            icon["shape_id"], auto_a, from_side="bottom", to_side="top",
+            from_pos=0.25,
         )
         icon_connector = shape(icon_conn["connector_id"])
         check(int(icon_shape.RowCount(7)) == 1,
@@ -232,15 +274,25 @@ def run_checks(client: VisioClient) -> dict:
               "icon connector is statically glued to the created point")
         check(end_part(icon_connector, True) == 100,
               "icon connector's begin ToPart == 100 (first connection point row)")
+        icon_box = bbox(icon_shape)
+        check(near(endpoint(icon_connector, True), side_point(icon_box, "bottom", 0.25)),
+              "icon: explicit from_pos=0.25 lands 25% along the bottom edge")
 
-        print("[6] save, reopen, verify glue persisted")
+        state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+        before_glue = {
+            sid: (s.get("from_glue"), s.get("from_side"), s.get("from_pos"),
+                  s.get("to_glue"), s.get("to_side"), s.get("to_pos"))
+            for sid, s in state.items() if s["is_connector"]
+        }
+
+        print("[7] save, reopen, verify glue persisted")
         client.save_document(save_path)
         app.ActiveDocument.Close()
         reopened = client.open_document(save_path)
         created_docs.append(app.ActiveDocument)
         page = client._page()
-        state = client.get_page_state()
-        conn_ids = [s["shape_id"] for s in state["shapes"] if s["is_connector"]]
+        state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+        conn_ids = [sid for sid, s in state.items() if s["is_connector"]]
         check(len(conn_ids) == 8,
               f"{reopened['document']}: 8 connectors survived save/reopen")
         pinned = sum(
@@ -255,8 +307,15 @@ def run_checks(client: VisioClient) -> dict:
             and glued_dynamically(page.Shapes.ItemFromID(sid), False)
         )
         check(dynamic == 1, "reopened: the auto connector is still dynamic")
+        after_glue = {
+            sid: (s.get("from_glue"), s.get("from_side"), s.get("from_pos"),
+                  s.get("to_glue"), s.get("to_side"), s.get("to_pos"))
+            for sid, s in state.items() if s["is_connector"]
+        }
+        check(after_glue == before_glue,
+              "reopened: glue kind, edge and edge position all persisted")
 
-        print("[7] export PNG for a visual check")
+        print("[8] export PNG for a visual check")
         result = client.export_page_png(png_path)
         check(os.path.getsize(result["path"]) > 1024,
               f"PNG exported to {result['path']} (open it to eyeball the routes)")

@@ -45,6 +45,9 @@ mcp = FastMCP(
         "connector endpoints with connect_shapes from_side/to_side "
         "(auto/top/bottom/left/right) for loop-backs and branches — e.g. "
         "loop back with right->right so the line doesn't wrap around shapes. "
+        "Several connectors on one edge are auto-spaced into free slots; use "
+        "from_pos/to_pos (0..1) to place one exactly. get_page_state reports "
+        "each connector end's glue kind, edge, position and point row. "
         "For Azure/"
         "AWS icons, Visio ships built-in cloud stencils — visio_status lists "
         "them in builtin_cloud_stencils and they open by bare filename (e.g. "
@@ -352,12 +355,14 @@ async def connect_shapes(
     page: Optional[str] = None,
     from_side: Literal["auto", "top", "bottom", "left", "right"] = "auto",
     to_side: Literal["auto", "top", "bottom", "left", "right"] = "auto",
+    from_pos: Optional[float] = None,
+    to_pos: Optional[float] = None,
 ) -> dict:
     """Connect two shapes with a connector glued to both. With the default
     from_side='auto' / to_side='auto' the connector uses Visio's dynamic glue:
     Visio picks the best sides and re-routes when shapes move. Pass a side to
     pin an endpoint deterministically — use it for loop-backs, decision
-    branches and parallel edges so lines don't wrap around or overlap.
+    branches and parallel edges so lines don't wrap around shapes or overlap.
 
     Args:
         label: Optional text on the connector (e.g. 'Yes' / 'No').
@@ -367,16 +372,23 @@ async def connect_shapes(
         line_weight_pt: Thicker lines (e.g. 2) suit peering/trust boundaries.
         line_color: Hex like '#808080'.
         from_side: 'auto' (dynamic glue), or 'top'/'bottom'/'left'/'right' to
-            attach the connector's begin to the midpoint of that side.
-            A pinned endpoint follows its shape when it moves but keeps the
-            chosen side — typical for a loop-back (right -> right) or a
-            decision's Yes/No branches.
+            attach the connector's begin to an edge of that shape. A pinned
+            endpoint follows its shape when it moves but keeps the chosen
+            edge and position — typical for a loop-back (right -> right) or
+            a decision's Yes/No branches.
         to_side: Same for the arrowhead end at to_id.
+        from_pos: Optional position along from_side, 0..1 (0 = start corner,
+            1 = end corner; left/right edges run bottom -> top, top/bottom
+            edges run left -> right). When omitted, a free slot is chosen
+            automatically so several connectors on one edge stay apart
+            (the first is the edge midpoint). Requires an explicit
+            from_side.
+        to_pos: Same for the to_side edge.
     """
     return await _worker.run(
         _client.connect_shapes, from_id, to_id, label, route,
         end_arrow, begin_arrow, page, line_pattern, line_weight_pt, line_color,
-        from_side, to_side,
+        from_side, to_side, from_pos, to_pos,
     )
 
 
@@ -525,8 +537,11 @@ async def badge_container(
 async def get_page_state(page: Optional[str] = None) -> dict:
     """List everything on a page: shape ids, master names, positions (inches,
     center), sizes, text, connector endpoints (from_id/to_id), and container
-    membership (container_ids). Call this to (re)discover shape ids, e.g.
-    after open_document."""
+    membership (container_ids). Connectors also report how each end is glued:
+    'dynamic' (Visio picks the side) or 'static' (a connection point), with
+    the edge (from_side/to_side), the position along it (from_pos/to_pos,
+    0..1) and the 1-based connection-point row (from_point/to_point). Call
+    this to (re)discover shape ids, e.g. after open_document."""
     return await _worker.run(_client.get_page_state, page)
 
 

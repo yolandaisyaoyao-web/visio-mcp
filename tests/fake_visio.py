@@ -92,14 +92,28 @@ class FakeCell:
             (self.shape.ID, self.Name, other_cell.shape.ID, other_cell.Name)
         )
         self.shape.connects.append(
-            FakeConnect(from_cell=self, to_sheet=other_cell.shape)
+            FakeConnect(from_cell=self, to_sheet=other_cell.shape, to_cell=other_cell)
         )
 
 
 class FakeConnect:
-    def __init__(self, from_cell, to_sheet):
+    """A Connect row: FromCell (BeginX/EndX) -> ToSheet's cell."""
+
+    def __init__(self, from_cell, to_sheet, to_cell=None):
         self.FromCell = from_cell
+        self.FromSheet = from_cell.shape
         self.ToSheet = to_sheet
+        self.ToCell = to_cell
+        name = str(from_cell.Name)
+        self.FromPart = 9 if name.startswith("Begin") else 12
+        to_name = str(getattr(to_cell, "Name", ""))
+        match = re.match(r"Connections\.X(\d+)$", to_name)
+        if match:  # connection points occupy parts 100.. (row index + 100)
+            self.ToPart = 100 + int(match.group(1)) - 1
+        elif to_name in ("PinX", "PinY"):  # dynamic glue
+            self.ToPart = 3
+        else:
+            self.ToPart = 0
 
 
 _DIM_PLAIN_RE = re.compile(r"^\s*([0-9.]+)\s*(?:mm|in)?\s*$")
@@ -314,6 +328,10 @@ class FakePage:
         else:  # ConnectorToolDataObject
             shape.OneD = 1
             shape.Master = None
+            if self.doc.app.fail_next_connector:
+                # make a post-glue styling step fail, to exercise rollback
+                self.doc.app.fail_next_connector = False
+                shape.CellsU("EndArrow").guarded = True
         self.shapes.append(shape)
         return shape
 
@@ -479,6 +497,8 @@ class FakeApplication:
         }
         # per-master Connection Points rows: {master_name: [(x_formula, y_formula)]}
         self.known_master_points: dict[str, list[tuple[str, str]]] = {}
+        # when True, the next dropped connector has a guarded EndArrow cell
+        self.fail_next_connector = False
 
     def GetBuiltInStencilFile(self, stencil_type, measurement):
         if stencil_type == 2:  # visBuiltInStencilContainers

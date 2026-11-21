@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import sys
 from typing import Any, Callable, Optional
 
@@ -680,8 +681,152 @@ class VisioClient:
 
     # -- connectors -----------------------------------------------------------
 
-    def _side_connection_cell(self, shape, side: str):
-        """The Connection Points cell at the midpoint of `side`.
+    @staticmethod
+    def _fmt_fraction(value: float) -> str:
+        """0.5 -> '0.5', 0.25 -> '0.25' — formula-friendly, no trailing zeros."""
+        text = f"{value:.4f}".rstrip("0").rstrip(".")
+        return text or "0"
+
+    def _edge_point_formulas(self, side: str, pos: float) -> tuple[str, str]:
+        """(X formula, Y formula) for the point at `pos` along `side`, in the
+        shape's local coordinates (0..Width, 0..Height)."""
+        p = self._fmt_fraction(pos)
+        if side == "left":
+            return "0", f"Height*{p}"
+        if side == "right":
+            return "Width", f"Height*{p}"
+        if side == "bottom":
+            return f"Width*{p}", "0"
+        return f"Width*{p}", "Height"  # top
+
+    @staticmethod
+    def _edge_fraction(side: str, x: float, y: float,
+                       width: float, height: float) -> Optional[float]:
+        """Position (0..1) of a local point on `side`, or None if it is not on
+        that edge. Mirrors _edge_point_formulas in reverse."""
+        tol = C.SIDE_POINT_TOLERANCE_IN
+        if side in ("left", "right"):
+            edge_x = 0.0 if side == "left" else width
+            if not height or abs(x - edge_x) > tol:
+                return None
+            return y / height
+        edge_y = 0.0 if side == "bottom" else height
+        if not width or abs(y - edge_y) > tol:
+            return None
+        return x / width
+
+    @staticmethod
+    def _side_of_point(x: float, y: float, width: float,
+                       height: float) -> tuple[Optional[str], Optional[float]]:
+        """(side, pos) for a connection point's local coordinates.
+
+        Corner points match two edges; the first in bottom/top/left/right
+        order wins (a corner is reported as bottom/top).
+        """
+        tol = C.SIDE_POINT_TOLERANCE_IN
+        candidates: list[tuple[str, float]] = []
+        if width:
+            if abs(y) <= tol:
+                candidates.append(("bottom", x / width))
+            if abs(y - height) <= tol:
+                candidates.append(("top", x / width))
+        if height:
+            if abs(x) <= tol:
+                candidates.append(("left", y / height))
+            if abs(x - width) <= tol:
+                candidates.append(("right", y / height))
+        return candidates[0] if candidates else (None, None)
+
+    @staticmethod
+    def _free_edge_pos(taken: list[float]) -> float:
+        """Largest free slot on a 0..1 edge, inset from the corners.
+
+        With nothing taken this is 0.5 — the round-1 midpoint behaviour.
+        Each further connector goes into the middle of the widest remaining
+        gap, so several branches on one side leave at distinct, ordered
+        points instead of overlapping on the midpoint.
+        """
+        lo, hi = C.EDGE_POS_MIN, C.EDGE_POS_MAX
+        points = sorted({round(t, 4) for t in taken if 0.0 <= t <= 1.0})
+        best_gap: Optional[float] = None
+        best_center = 0.5
+        prev = lo
+        for point in points + [hi]:
+            if point <= prev:
+                continue
+            gap = point - prev
+            if best_gap is None or gap > best_gap:
+                best_gap, best_center = gap, (prev + point) / 2.0
+            prev = point
+        return best_center
+
+    @staticmethod
+    def _connect_point_row(connect) -> Optional[int]:
+        """Zero-based Connection Points row glued by a Connect row, or None
+        for dynamic glue (PinX/PinY) and unreadable targets.
+
+        ToPart >= 100 identifies a connection point (row = ToPart - 100);
+        the ToCell name ('Connections.X3') is the fallback.
+        """
+        try:
+            to_part = int(connect.ToPart)
+        except Exception:
+            to_part = None
+        if to_part is not None and to_part >= 100:
+            return to_part - 100
+        try:
+            match = re.match(r"Connections\.X(\d+)$", str(connect.ToCell.Name))
+        except Exception:
+            return None
+        return int(match.group(1)) - 1 if match else None
+
+    def _used_edge_positions(self, page, shape, side: str) -> list[float]:
+        """Fractions of `side` already occupied by statically glued connector
+        ends. Dynamic glue does not occupy a fixed point and is ignored."""
+        width = float(shape.CellsU("Width").ResultIU)
+        height = float(shape.CellsU("Height").ResultIU)
+        section = C.VIS_SECTION_CONNECTION_PTS
+        used: set[float] = set()
+        for other in _items(page.Shapes):
+            try:
+                if not int(other.OneD):
+                    continue
+                connects = list(_items(other.Connects))
+            except Exception:
+                continue
+            for connect in connects:
+                try:
+                    if int(connect.ToSheet.ID) != int(shape.ID):
+                        continue
+                except Exception:
+                    continue
+                row = self._connect_point_row(connect)
+                if row is None:
+                    continue
+                try:
+                    x = float(shape.CellsSRC(section, row, C.VIS_CNNCT_X).ResultIU)
+                    y = float(shape.CellsSRC(section, row, C.VIS_CNNCT_Y).ResultIU)
+                except Exception:
+                    continue
+                frac = self._edge_fraction(side, x, y, width, height)
+                if frac is not None and 0.0 <= frac <= 1.0:
+                    used.add(round(frac, 4))
+        return sorted(used)
+
+    def _resolve_edge_pos(self, page, shape, side: str, pos: Optional[float],
+                          extra_taken: tuple[float, ...] = ()) -> Optional[float]:
+        """Position to use for one endpoint: None for dynamic glue, the given
+        fraction when explicit, otherwise the widest free slot on that side."""
+        if side == "auto":
+            return None
+        if pos is not None:
+            return float(pos)
+        taken = self._used_edge_positions(page, shape, side) + list(extra_taken)
+        return self._free_edge_pos(taken)
+
+    def _edge_connection_cell(self, shape, side: str, pos: float):
+        """The Connection Points cell at `pos` along `side`, creating it when
+        no point sits there yet.
 
         Explicit sides pin the connector with static glue to this point —
         dynamic glue (side='auto') lets Visio choose sides from the geometry
@@ -689,16 +834,18 @@ class VisioClient:
         Connection Points section differs between masters (BASFLO's Process
         stores left/right/bottom/top, Decision left/right/top/bottom and
         Start/End bottom/top/left/right), so rows are matched by their local
-        X/Y coordinates, never by index. Shapes without a point on that side
-        (e.g. imported icons) get one created at the side midpoint.
+        X/Y coordinates, never by index.
         """
         width = float(shape.CellsU("Width").ResultIU)
         height = float(shape.CellsU("Height").ResultIU)
+        pos = round(float(pos), 4)  # keep formula and duplicate check in sync
+        x_formula, y_formula = self._edge_point_formulas(side, pos)
+        # evaluate the formulas locally: no need to ask Visio to recalc
         target_x, target_y = {
-            "left": (0.0, height / 2.0),
-            "right": (width, height / 2.0),
-            "bottom": (width / 2.0, 0.0),
-            "top": (width / 2.0, height),
+            "left": (0.0, height * pos),
+            "right": (width, height * pos),
+            "bottom": (width * pos, 0.0),
+            "top": (width * pos, height),
         }[side]
 
         section = C.VIS_SECTION_CONNECTION_PTS
@@ -709,19 +856,51 @@ class VisioClient:
                     and abs(y - target_y) <= C.SIDE_POINT_TOLERANCE_IN):
                 return shape.CellsSRC(section, row, C.VIS_CNNCT_X)
 
-        x_formula, y_formula = C.SIDE_POINT_FORMULAS[side]
         row = int(shape.AddRow(section, C.VIS_ROW_LAST, C.VIS_TAG_DEFAULT))
         x_cell = shape.CellsSRC(section, row, C.VIS_CNNCT_X)
         shape.CellsSRC(section, row, C.VIS_CNNCT_Y).FormulaU = y_formula
         x_cell.FormulaU = x_formula
         return x_cell
 
-    def _glue_target(self, shape, side: str):
+    def _glue_target(self, shape, side: str, pos: Optional[float]):
         """Cell a connector endpoint is glued to: PinX for dynamic glue
-        ('auto'), a side connection point for a pinned side."""
+        ('auto'), the point at `pos` along the side for a pinned endpoint."""
         if side == "auto":
             return shape.CellsU("PinX")
-        return self._side_connection_cell(shape, side)
+        return self._edge_connection_cell(shape, side, 0.5 if pos is None else pos)
+
+    def _connect_endpoint_info(self, connect) -> dict:
+        """Glue details for one connector endpoint (a Connect row).
+
+        Reports whether the end is dynamically glued ('dynamic') or glued to
+        a connection point ('static'), and for static glue the edge, the
+        position along it (0..1) and the 1-based connection-point row.
+        """
+        info = {"glue": None, "side": None, "pos": None, "point": None}
+        row = self._connect_point_row(connect)
+        if row is None:
+            try:
+                cell_name = str(connect.ToCell.Name)
+            except Exception:
+                cell_name = ""
+            if cell_name in ("PinX", "PinY"):
+                info["glue"] = "dynamic"
+            return info
+        info["glue"] = "static"
+        info["point"] = row + 1
+        try:
+            target = connect.ToSheet
+            width = float(target.CellsU("Width").ResultIU)
+            height = float(target.CellsU("Height").ResultIU)
+            section = C.VIS_SECTION_CONNECTION_PTS
+            x = float(target.CellsSRC(section, row, C.VIS_CNNCT_X).ResultIU)
+            y = float(target.CellsSRC(section, row, C.VIS_CNNCT_Y).ResultIU)
+        except Exception:
+            return info
+        side, pos = self._side_of_point(x, y, width, height)
+        info["side"] = side
+        info["pos"] = round(pos, 4) if pos is not None else None
+        return info
 
     def connect_shapes(
         self,
@@ -737,6 +916,8 @@ class VisioClient:
         line_color: Optional[str] = None,
         from_side: str = "auto",
         to_side: str = "auto",
+        from_pos: Optional[float] = None,
+        to_pos: Optional[float] = None,
     ) -> dict:
         if route not in C.CONNECTOR_ROUTES:
             raise VisioMcpError(
@@ -751,19 +932,58 @@ class VisioClient:
                 raise VisioMcpError(
                     f"{arg_name} must be one of {list(C.CONNECTOR_SIDES)}, got {side!r}"
                 )
+        for side_name, pos_name, side, pos in (
+            ("from_side", "from_pos", from_side, from_pos),
+            ("to_side", "to_pos", to_side, to_pos),
+        ):
+            if pos is None:
+                continue
+            if side == "auto":
+                raise VisioMcpError(
+                    f"{pos_name} requires an explicit {side_name} "
+                    "(top/bottom/left/right); 'auto' uses Visio's dynamic glue "
+                    "and has no fixed point on an edge."
+                )
+            if not 0.0 <= float(pos) <= 1.0:
+                raise VisioMcpError(
+                    f"{pos_name} must be between 0 and 1 (a fraction along the "
+                    f"edge), got {pos!r}"
+                )
         app = self._app()
         page = self._page(page_name)
         shape_from = self._shape_by_id(page, from_id)
         shape_to = self._shape_by_id(page, to_id)
+
+        # Resolve crowded-edge slots before touching the page: the scan only
+        # reads existing glue, so nothing needs rolling back if it fails.
+        resolved_from = self._guard(
+            "resolving the from edge position",
+            lambda: self._resolve_edge_pos(page, shape_from, from_side, from_pos),
+        )
+        extra_taken: tuple[float, ...] = ()
+        if (resolved_from is not None and to_side == from_side
+                and int(shape_to.ID) == int(shape_from.ID)):
+            extra_taken = (resolved_from,)  # self-loop: from and to share the edge
+        resolved_to = self._guard(
+            "resolving the to edge position",
+            lambda: self._resolve_edge_pos(
+                page, shape_to, to_side, to_pos, extra_taken
+            ),
+        )
 
         def _connect():
             conn = page.Drop(app.ConnectorToolDataObject, 0.0, 0.0)
             # 'auto' glues to PinX = dynamic glue: Visio picks the best sides
             # and re-routes as the layout changes. A pinned side glues to that
             # side's connection point instead (static glue): the endpoint
-            # follows its shape and re-routes, but keeps the chosen side.
-            conn.CellsU("BeginX").GlueTo(self._glue_target(shape_from, from_side))
-            conn.CellsU("EndX").GlueTo(self._glue_target(shape_to, to_side))
+            # follows its shape and re-routes, but keeps the chosen edge and
+            # position along it.
+            conn.CellsU("BeginX").GlueTo(
+                self._glue_target(shape_from, from_side, resolved_from)
+            )
+            conn.CellsU("EndX").GlueTo(
+                self._glue_target(shape_to, to_side, resolved_to)
+            )
             route_style, route_ext = C.CONNECTOR_ROUTES[route]
             conn.CellsU("ShapeRouteStyle").ResultIU = route_style
             conn.CellsU("ConLineRouteExt").ResultIU = route_ext
@@ -783,7 +1003,18 @@ class VisioClient:
                 conn.Text = label
             return conn
 
-        conn = self._guard(f"connecting shape {from_id} -> {to_id}", _connect)
+        # One undo scope covers the dropped connector AND any connection point
+        # created for it, so a failed glue/style step leaves the page untouched.
+        scope = self._guard("starting undo scope", lambda: app.BeginUndoScope("Connect shapes"))
+        try:
+            conn = self._guard(f"connecting shape {from_id} -> {to_id}", _connect)
+            self._guard("closing undo scope", lambda: app.EndUndoScope(scope, True))
+        except Exception:
+            try:
+                app.EndUndoScope(scope, False)  # False = roll the connector back
+            except Exception:
+                pass
+            raise
         return {
             "connector_id": int(conn.ID),
             "from_id": from_id,
@@ -791,6 +1022,8 @@ class VisioClient:
             "route": route,
             "from_side": from_side,
             "to_side": to_side,
+            "from_pos": round(resolved_from, 4) if resolved_from is not None else None,
+            "to_pos": round(resolved_to, 4) if resolved_to is not None else None,
         }
 
     # -- pages ----------------------------------------------------------------
@@ -1163,18 +1396,29 @@ class VisioClient:
                 info["is_container"] = False
             if is_connector:
                 from_id = to_id = None
+                from_end: dict = {}
+                to_end: dict = {}
                 try:
                     for connect in _items(shape.Connects):
                         cell_name = str(connect.FromCell.Name)
                         target = int(connect.ToSheet.ID)
+                        end_info = self._connect_endpoint_info(connect)
                         if cell_name.startswith("Begin"):
-                            from_id = target
+                            from_id, from_end = target, end_info
                         elif cell_name.startswith("End"):
-                            to_id = target
+                            to_id, to_end = target, end_info
                 except Exception:
                     pass
                 info["from_id"] = from_id
                 info["to_id"] = to_id
+                info["from_glue"] = from_end.get("glue")
+                info["from_side"] = from_end.get("side")
+                info["from_pos"] = from_end.get("pos")
+                info["from_point"] = from_end.get("point")
+                info["to_glue"] = to_end.get("glue")
+                info["to_side"] = to_end.get("side")
+                info["to_pos"] = to_end.get("pos")
+                info["to_point"] = to_end.get("point")
             shapes.append(info)
         sheet = page.PageSheet
         return {

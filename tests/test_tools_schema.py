@@ -84,6 +84,17 @@ async def test_connect_shapes_side_enums():
     assert schema["properties"]["to_side"].get("default") == "auto"
 
 
+async def test_connect_shapes_edge_position_params():
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    schema = tools["connect_shapes"].inputSchema
+    for name in ("from_pos", "to_pos"):
+        prop = schema["properties"][name]
+        assert prop.get("default") is None, name
+        # Optional[float] -> number-or-null
+        types = {entry.get("type") for entry in prop.get("anyOf", [prop])}
+        assert "number" in types and "null" in types, name
+
+
 async def test_add_container_requires_label_and_members():
     tools = {t.name: t for t in await server.mcp.list_tools()}
     schema = tools["add_container"].inputSchema

@@ -184,17 +184,17 @@ CONNECTOR_ROUTES: dict[str, tuple[int, int]] = {
 # --- Connector endpoint sides (connect_shapes from_side / to_side) ---------
 # 'auto' keeps Visio's dynamic glue (it re-picks the best side as shapes
 # move). The other values pin the endpoint with static glue to the shape's
-# connection point at the midpoint of that side.
+# connection point at a position along that side (the midpoint by default;
+# from_pos/to_pos move it).
 CONNECTOR_SIDES: tuple[str, ...] = ("auto", "top", "bottom", "left", "right")
 
-# Side -> (X formula, Y formula) for a point at the midpoint of that side in
-# the shape's local coordinates (0..Width, 0..Height).
-SIDE_POINT_FORMULAS: dict[str, tuple[str, str]] = {
-    "left": ("0", "Height*0.5"),
-    "right": ("Width", "Height*0.5"),
-    "bottom": ("Width*0.5", "0"),
-    "top": ("Width*0.5", "Height"),
-}
+# Position of a connection point along a chosen side, as a fraction 0..1:
+# left/right edges run bottom -> top, top/bottom edges run left -> right.
+# When several connectors share one side, each new endpoint goes into the
+# largest free slot inside this inset range, so exits/entries stay ordered
+# instead of piling up on the side midpoint.
+EDGE_POS_MIN = 0.1
+EDGE_POS_MAX = 0.9
 
 # --- Connection Points ShapeSheet section (cells are addressed by
 #     Shape.CellsSRC(section, row, column)) ---------------------------------

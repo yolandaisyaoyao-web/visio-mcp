@@ -255,10 +255,10 @@ def test_connect_side_creates_missing_connection_point(client, app):
     assert point.y.FormulaU == "Height*0.5"
     assert app.ActivePage.glue_log[0] == (app.ActivePage.shapes[-1].ID, "BeginX", 2,
                                           "Connections.X1")
-    # the same side is reused (matched by coordinates) on the next connect,
+    # an explicit position matches the point by coordinates and reuses it,
     # even after the shape is resized
     shape.CellsU("Width").ResultIU = 2.0
-    client.connect_shapes(2, 1, from_side="right")
+    client.connect_shapes(2, 1, from_side="right", from_pos=0.5)
     assert shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 1
 
 
@@ -292,6 +292,89 @@ def test_connect_rejects_unknown_side(client):
         client.connect_shapes(1, 2, from_side="middle")
     with pytest.raises(VisioMcpError, match="to_side"):
         client.connect_shapes(1, 2, to_side="diagonal")
+
+
+def test_connect_auto_positions_spread_on_the_same_side(client, app):
+    _build_flowchart(client)
+    first = client.connect_shapes(2, 1, from_side="right")
+    second = client.connect_shapes(2, 3, from_side="right")
+    shape = app.ActivePage.shapes[1]  # Process, the shared source
+    assert first["from_pos"] == 0.5
+    assert second["from_pos"] == pytest.approx(0.3)
+    # a second connection point was added for the new slot
+    assert shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 5
+    assert shape.conn_pts[4].x.FormulaU == "Width"
+    assert shape.conn_pts[4].y.FormulaU == "Height*0.3"
+    assert app.ActivePage.glue_log[-2] == (
+        second["connector_id"], "BeginX", 2, "Connections.X5"
+    )
+    # get_page_state reports the two distinct positions on the right edge
+    state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+    assert state[first["connector_id"]]["from_side"] == "right"
+    assert state[first["connector_id"]]["from_pos"] == 0.5
+    assert state[second["connector_id"]]["from_pos"] == pytest.approx(0.3)
+
+
+def test_connect_auto_positions_ignore_dynamic_glue(client):
+    _build_flowchart(client)
+    client.connect_shapes(1, 2)  # dynamic end at shape 2's PinX
+    result = client.connect_shapes(2, 3, from_side="right")
+    assert result["from_pos"] == 0.5, "dynamic glue occupies no fixed edge slot"
+
+
+def test_connect_explicit_pos_creates_and_reuses_point(client, app):
+    _build_flowchart(client)
+    result = client.connect_shapes(1, 2, from_side="right", from_pos=0.25)
+    shape = app.ActivePage.shapes[0]
+    assert result["from_pos"] == 0.25
+    assert shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 5
+    point = shape.conn_pts[4]
+    assert point.x.FormulaU == "Width"
+    assert point.y.FormulaU == "Height*0.25"
+    client.connect_shapes(1, 2, from_side="right", from_pos=0.25)
+    assert shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 5
+
+
+def test_connect_rejects_position_without_side_and_out_of_range(client):
+    _build_flowchart(client)
+    with pytest.raises(VisioMcpError, match="from_pos"):
+        client.connect_shapes(1, 2, from_pos=0.3)
+    with pytest.raises(VisioMcpError, match="to_pos"):
+        client.connect_shapes(1, 2, to_side="left", to_pos=1.5)
+    with pytest.raises(VisioMcpError, match="to_pos"):
+        client.connect_shapes(1, 2, to_side="left", to_pos=-0.1)
+
+
+def test_get_page_state_reports_glue_side_and_point(client):
+    _build_flowchart(client)
+    dynamic = client.connect_shapes(1, 2)
+    pinned = client.connect_shapes(2, 3, from_side="bottom", to_side="top")
+    state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+    dyn = state[dynamic["connector_id"]]
+    assert (dyn["from_glue"], dyn["to_glue"]) == ("dynamic", "dynamic")
+    assert dyn["from_side"] is None and dyn["from_pos"] is None
+    assert dyn["from_point"] is None
+    pin = state[pinned["connector_id"]]
+    assert (pin["from_glue"], pin["to_glue"]) == ("static", "static")
+    assert (pin["from_side"], pin["to_side"]) == ("bottom", "top")
+    assert (pin["from_pos"], pin["to_pos"]) == (0.5, 0.5)
+    # BASFLO Process rows are left/right/bottom/top -> bottom is row 3
+    assert pin["from_point"] == 3
+    assert pin["to_point"] == 4
+
+
+def test_connect_commits_undo_scope(client, app):
+    _build_flowchart(client)
+    client.connect_shapes(1, 2)
+    assert app.undo_scopes[-1][1] is True, "successful connect must commit"
+
+
+def test_connect_failure_rolls_back_undo_scope(client, app):
+    _build_flowchart(client)
+    app.fail_next_connector = True  # EndArrow becomes guarded after the drop
+    with pytest.raises(VisioMcpError, match="guarded"):
+        client.connect_shapes(2, 1, from_side="right")
+    assert app.undo_scopes[-1][1] is False, "failed connect must roll back"
 
 
 def test_style_shape_sets_formulas(client, app):
