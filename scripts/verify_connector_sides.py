@@ -9,12 +9,17 @@ checks that:
   - pinned endpoints statically glue to the connection point on the
     requested side (formula references Connections.X, ToPart >= 100),
   - default 'auto' endpoints stay dynamically glued (_WALKGLUE, ToPart 3),
-  - several connectors on one edge get distinct auto-slotted positions
-    (loop-back and the decision's No branch), and explicit from_pos works,
+  - several connectors on one edge get distinct auto-slotted positions at
+    least EDGE_MIN_SLOT_GAP_IN apart (loop-back and the decision's No branch),
+  - corner positions (0/1) are rejected without side effects, and explicit
+    from_pos works,
   - endpoints stay on their pinned edge/position after a shape moves and
     after auto_layout,
-  - get_page_state reports glue kind, edge, position and point row,
+  - get_page_state reports glue kind, edge, position and point row, matching
+    the positions returned by connect_shapes,
   - an imported icon with no connection points gets a side point created,
+  - an injected mid-connect failure rolls back both the connector and the
+    connection point it created (real Visio undo state, not just a flag),
   - glue survives save + reopen of the .vsdx,
   - the routed page still exports as a PNG (open it and eyeball the result).
 
@@ -37,6 +42,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 if hasattr(sys.stdout, "reconfigure"):  # localized master names on Windows
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+from visio_mcp import constants as C  # noqa: E402
+from visio_mcp.errors import VisioMcpError  # noqa: E402
 from visio_mcp.runtime import ComWorker  # noqa: E402
 from visio_mcp.visio_client import VisioClient  # noqa: E402
 
@@ -192,21 +199,42 @@ def run_checks(client: VisioClient) -> dict:
         incr_box = bbox(shape(incr))
         cond_box = bbox(shape(cond))
         end_box = bbox(shape(end))
+        cond_height = float(shape(cond).CellsU("Height").ResultIU)
+        # second slot = midpoint minus the minimum physical gap, as a fraction
+        expected_no_pos = round(0.5 - C.EDGE_MIN_SLOT_GAP_IN / cond_height, 4)
         check(near(endpoint(conn["loop"], True), side_point(incr_box, "right", 0.5)),
               "loop: begin sits at i++'s right edge midpoint")
         check(near(endpoint(conn["loop"], False), side_point(cond_box, "right", 0.5)),
               "loop: end sits at the decision's right edge midpoint")
-        check(near(endpoint(conn["no"], True), side_point(cond_box, "right", 0.3)),
-              "no: second connector on that edge auto-slotted at pos 0.3")
+        check(near(endpoint(conn["no"], True),
+                   side_point(cond_box, "right", expected_no_pos)),
+              f"no: second connector auto-slotted at {expected_no_pos} "
+              "(0.15 in from the midpoint)")
         check(near(endpoint(conn["no"], False), side_point(end_box, "left", 0.5)),
               "no: end sits at the end shape's left edge midpoint")
         loop_end = endpoint(conn["loop"], False)
         no_begin = endpoint(conn["no"], True)
-        check(abs(loop_end[1] - no_begin[1]) > 0.1,
-              "two branches on the decision's right edge leave from distinct points")
+        check(abs(loop_end[1] - no_begin[1]) >= C.EDGE_MIN_SLOT_GAP_IN - 1e-3,
+              "two branches on the decision's right edge are >= 0.15 in apart")
         check(abs(conns["loop"]["to_pos"] - 0.5) < 1e-6
-              and abs(conns["no"]["from_pos"] - 0.3) < 1e-6,
+              and abs(conns["no"]["from_pos"] - expected_no_pos) < 1e-6,
               "connect_shapes returns the resolved edge positions")
+
+        print("[2b] corner positions are rejected without side effects")
+        before_shapes = int(page.Shapes.Count)
+        before_points = int(shape(cond).RowCount(7))
+        for corner_pos in (0, 1, 0.0005, 0.9995):
+            try:
+                client.connect_shapes(cond, end, from_side="right",
+                                      from_pos=corner_pos)
+                check(False, f"corner pos {corner_pos} must be rejected")
+            except VisioMcpError as exc:
+                check("corner" in str(exc),
+                      f"corner pos {corner_pos} rejected with guidance")
+        check(int(page.Shapes.Count) == before_shapes,
+              "corner rejections dropped no connector")
+        check(int(shape(cond).RowCount(7)) == before_points,
+              "corner rejections created no connection point")
 
         print("[3] get_page_state reports glue kind, edge and point")
         state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
@@ -216,8 +244,11 @@ def run_checks(client: VisioClient) -> dict:
               and abs(loop_state["to_pos"] - 0.5) < 1e-6,
               "get_page_state: loop end -> static right edge @ 0.5")
         check(no_state["from_glue"] == "static" and no_state["from_side"] == "right"
-              and abs(no_state["from_pos"] - 0.3) < 1e-6,
-              "get_page_state: No branch begin -> static right edge @ 0.3")
+              and abs(no_state["from_pos"] - expected_no_pos) < 1e-6,
+              "get_page_state: No branch begin -> static right edge at the "
+              "expected slot")
+        check(abs(conns["no"]["from_pos"] - no_state["from_pos"]) < 1e-6,
+              "returned edge position matches get_page_state exactly")
         check(no_state["from_point"] != loop_state["to_point"],
               "the two connectors use different connection-point rows")
         auto_state = state[conns["auto"]["connector_id"]]
@@ -236,8 +267,9 @@ def run_checks(client: VisioClient) -> dict:
               "loop: begin still on i++'s right edge midpoint after the move")
         check(near(endpoint(conn["body"], False), side_point(incr_box, "top", 0.5)),
               "body: end still on i++'s top edge midpoint after the move")
-        check(near(endpoint(conn["no"], True), side_point(cond_box, "right", 0.3)),
-              "no: 0.3 slot kept on the decision's right edge after the move")
+        check(near(endpoint(conn["no"], True),
+                   side_point(cond_box, "right", expected_no_pos)),
+              "no: assigned slot kept on the decision's right edge after the move")
         before_auto = endpoint(conn["auto"], False)
         shape(auto_b).CellsU("PinX").ResultIU = 11.0
         shape(auto_b).CellsU("PinY").ResultIU = 8.0
@@ -251,7 +283,8 @@ def run_checks(client: VisioClient) -> dict:
         check(near(endpoint(conn["loop"], True), side_point(incr_box, "right", 0.5)),
               "loop: begin stays at i++'s right edge midpoint after auto_layout")
         check(near(endpoint(conn["loop"], False), side_point(cond_box, "right", 0.5))
-              and near(endpoint(conn["no"], True), side_point(cond_box, "right", 0.3)),
+              and near(endpoint(conn["no"], True),
+                       side_point(cond_box, "right", expected_no_pos)),
               "both right-edge slots survive auto_layout")
 
         print("[6] imported icon: explicit pos + auto point creation")
@@ -285,7 +318,38 @@ def run_checks(client: VisioClient) -> dict:
             for sid, s in state.items() if s["is_connector"]
         }
 
-        print("[7] save, reopen, verify glue persisted")
+        print("[7] injected failure rolls back connector and connection point")
+        probe = shape(icon["shape_id"])
+        before_shapes = int(page.Shapes.Count)
+        before_points = int(probe.RowCount(7))
+        before_conns = sum(1 for s in state.values() if s["is_connector"])
+
+        original_glue = client._glue_target
+
+        def failing_glue(target_shape, target_side, target_pos):
+            original_glue(target_shape, target_side, target_pos)  # creates the point
+            raise RuntimeError("injected connector failure")
+
+        client._glue_target = failing_glue
+        try:
+            try:
+                client.connect_shapes(icon["shape_id"], auto_b, from_side="left")
+                check(False, "injected failure must propagate")
+            except Exception as exc:  # noqa: BLE001 — the injected RuntimeError
+                check("injected connector failure" in str(exc),
+                      "connect_shapes surfaced the injected failure")
+        finally:
+            del client._glue_target
+
+        check(int(page.Shapes.Count) == before_shapes,
+              "rollback removed the dropped connector shape")
+        check(int(shape(icon["shape_id"]).RowCount(7)) == before_points,
+              "rollback removed the connection point created before the failure")
+        check(sum(1 for s in client.get_page_state()["shapes"] if s["is_connector"])
+              == before_conns,
+              "no orphan connector after rollback")
+
+        print("[8] save, reopen, verify glue persisted")
         client.save_document(save_path)
         app.ActiveDocument.Close()
         reopened = client.open_document(save_path)
@@ -315,7 +379,7 @@ def run_checks(client: VisioClient) -> dict:
         check(after_glue == before_glue,
               "reopened: glue kind, edge and edge position all persisted")
 
-        print("[8] export PNG for a visual check")
+        print("[9] export PNG for a visual check")
         result = client.export_page_png(png_path)
         check(os.path.getsize(result["path"]) > 1024,
               f"PNG exported to {result['path']} (open it to eyeball the routes)")

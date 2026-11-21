@@ -196,6 +196,19 @@ CONNECTOR_SIDES: tuple[str, ...] = ("auto", "top", "bottom", "left", "right")
 EDGE_POS_MIN = 0.1
 EDGE_POS_MAX = 0.9
 
+# Positions within this fraction of each other are the same connection point.
+# The tolerance is relative to the edge, not absolute inches: on a small
+# icon 0.01 in would otherwise merge visibly distinct points.
+EDGE_POS_MATCH_TOLERANCE = 0.001
+
+# 0 and 1 are corners: a corner lies on two edges, so its side is ambiguous.
+# Explicit positions must stay outside this margin (auto slots start at 0.1).
+EDGE_CORNER_EPS = 0.001
+
+# Minimum physical distance between auto-assigned points on one edge; this
+# caps how many connectors a short edge can hold (capacity = 1 + 2 * steps).
+EDGE_MIN_SLOT_GAP_IN = 0.15
+
 # --- Connection Points ShapeSheet section (cells are addressed by
 #     Shape.CellsSRC(section, row, column)) ---------------------------------
 # The row order is master-specific (BASFLO stores Process = L/R/B/T,

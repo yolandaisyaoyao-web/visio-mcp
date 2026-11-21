@@ -377,12 +377,14 @@ async def connect_shapes(
             edge and position — typical for a loop-back (right -> right) or
             a decision's Yes/No branches.
         to_side: Same for the arrowhead end at to_id.
-        from_pos: Optional position along from_side, 0..1 (0 = start corner,
-            1 = end corner; left/right edges run bottom -> top, top/bottom
-            edges run left -> right). When omitted, a free slot is chosen
-            automatically so several connectors on one edge stay apart
-            (the first is the edge midpoint). Requires an explicit
-            from_side.
+        from_pos: Optional position along from_side, strictly between 0 and 1
+            (left/right edges run bottom -> top, top/bottom edges run
+            left -> right). 0 and 1 are corners shared by two edges and are
+            rejected as ambiguous — use e.g. 0.01/0.99 or the adjacent side.
+            When omitted, a free slot is chosen automatically with at least
+            0.15 in between points (the first is the edge midpoint); a short,
+            crowded edge errors instead of packing points together. Requires
+            an explicit from_side.
         to_pos: Same for the to_side edge.
     """
     return await _worker.run(

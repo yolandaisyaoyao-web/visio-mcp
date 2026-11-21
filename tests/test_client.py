@@ -335,6 +335,80 @@ def test_connect_explicit_pos_creates_and_reuses_point(client, app):
     assert shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 5
 
 
+def test_connect_close_positions_stay_distinct(client, app):
+    # 0.25 vs 0.26 is 0.0075 in apart on the 0.75 in edge — inside the old
+    # absolute 0.01 in tolerance, but clearly different fractions.
+    _build_flowchart(client)
+    first = client.connect_shapes(1, 2, from_side="right", from_pos=0.25)
+    second = client.connect_shapes(1, 2, from_side="right", from_pos=0.26)
+    shape = app.ActivePage.shapes[0]
+    assert (first["from_pos"], second["from_pos"]) == (0.25, 0.26)
+    assert shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 6
+    state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+    assert state[first["connector_id"]]["from_pos"] == 0.25
+    assert state[second["connector_id"]]["from_pos"] == 0.26
+
+
+def test_connect_reused_point_returns_actual_position(client, app):
+    _build_flowchart(client)
+    client.connect_shapes(1, 2, from_side="right", from_pos=0.25)
+    # within the fraction tolerance -> reuse the 0.25 point and report 0.25
+    reused = client.connect_shapes(1, 2, from_side="right", from_pos=0.2505)
+    shape = app.ActivePage.shapes[0]
+    assert reused["from_pos"] == 0.25, "result must match the point actually glued"
+    assert shape.RowCount(C.VIS_SECTION_CONNECTION_PTS) == 5
+    state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+    assert state[reused["connector_id"]]["from_pos"] == 0.25
+
+
+def test_connect_corner_positions_rejected(client, app):
+    _build_flowchart(client)
+    before = len(app.ActivePage.shapes)
+    for pos in (0, 1, 0.0005, 0.9995):
+        with pytest.raises(VisioMcpError, match="corner"):
+            client.connect_shapes(1, 2, from_side="right", from_pos=pos)
+    with pytest.raises(VisioMcpError, match="corner"):
+        client.connect_shapes(1, 2, to_side="left", to_pos=0)
+    assert len(app.ActivePage.shapes) == before, "rejected corners must not drop a connector"
+    # a hair inside the corner is accepted
+    result = client.connect_shapes(1, 2, from_side="right", from_pos=0.002)
+    assert result["from_pos"] == 0.002
+
+
+def test_connect_auto_slots_respect_min_spacing_on_short_edge(client, app):
+    _build_flowchart(client)
+    shape = app.ActivePage.shapes[1]
+    shape.CellsU("Height").ResultIU = 0.3  # one 0.15 in slot fits: [0.5]
+    first = client.connect_shapes(2, 1, from_side="right")
+    assert first["from_pos"] == 0.5
+    before = len(app.ActivePage.shapes)
+    with pytest.raises(VisioMcpError, match="fits at most|spacing"):
+        client.connect_shapes(2, 1, from_side="right")
+    assert len(app.ActivePage.shapes) == before, "refused auto-slot must not drop a connector"
+    # explicit positions are the caller's choice and still work
+    explicit = client.connect_shapes(2, 1, from_side="right", from_pos=0.3)
+    assert explicit["from_pos"] == 0.3
+
+
+def test_connect_auto_slots_capacity_and_order(client, app):
+    _build_flowchart(client)
+    positions = [
+        client.connect_shapes(2, 1, from_side="right")["from_pos"]
+        for _ in range(5)
+    ]
+    assert positions == [0.5, 0.3, 0.7, 0.1, 0.9]
+    height = app.ActivePage.shapes[1].CellsU("Height").ResultIU
+    ordered = sorted(positions)
+    assert all(
+        (b - a) * height >= C.EDGE_MIN_SLOT_GAP_IN - 1e-6
+        for a, b in zip(ordered, ordered[1:])
+    )
+    before = len(app.ActivePage.shapes)
+    with pytest.raises(VisioMcpError, match="at most 5"):
+        client.connect_shapes(2, 1, from_side="right")
+    assert len(app.ActivePage.shapes) == before
+
+
 def test_connect_rejects_position_without_side_and_out_of_range(client):
     _build_flowchart(client)
     with pytest.raises(VisioMcpError, match="from_pos"):
