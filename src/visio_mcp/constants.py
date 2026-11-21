@@ -217,7 +217,23 @@ EDGE_MIN_SLOT_GAP_IN = 0.15
 VIS_SECTION_CONNECTION_PTS = 7
 VIS_CNNCT_X = 0
 VIS_CNNCT_Y = 1
+# Geometry1 section and the X/Y cell columns of one geometry row
+# (visSectionFirstComponent = 10). Row 0 carries NoFill/NoLine flags; the
+# vertex rows follow.
+VIS_SECTION_FIRST_COMPONENT = 10
+VIS_GEOM_X = 0
+VIS_GEOM_Y = 1
 VIS_ROW_LAST = -2          # AddRow: append after the last row
 VIS_TAG_DEFAULT = 0        # AddRow row tag accepted by the Connection Points
                            # section (visTagCnnctPt is rejected by Visio 16)
-SIDE_POINT_TOLERANCE_IN = 0.01  # how close a point must be to the side midpoint
+
+# How far off an edge a connection point may sit and still count as lying on
+# it. The allowance is a fraction of the edge it is measured against, never
+# an absolute inch value: on a large shape 0.01 in is too tight to absorb
+# anything while on a small icon it swallows whole edges, and a point just
+# above a corner gets reported as lying on the adjacent edge. It must stay
+# below EDGE_CORNER_EPS so a point created at the smallest accepted explicit
+# position is never mistaken for one on the neighbouring edge.
+SIDE_POINT_TOLERANCE_FRAC = 0.0005
+# Absolute floor for tiny/degenerate shapes, absorbing float noise only.
+SIDE_POINT_TOLERANCE_MIN_IN = 1e-6

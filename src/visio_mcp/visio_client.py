@@ -700,18 +700,30 @@ class VisioClient:
         return f"Width*{p}", "Height"  # top
 
     @staticmethod
+    def _side_tolerance(length: float) -> float:
+        """Allowance for a point being considered on an edge, scaled to the
+        edge's own length (see C.SIDE_POINT_TOLERANCE_FRAC)."""
+        return max(C.SIDE_POINT_TOLERANCE_MIN_IN,
+                   abs(length) * C.SIDE_POINT_TOLERANCE_FRAC)
+
+    @staticmethod
     def _edge_fraction(side: str, x: float, y: float,
                        width: float, height: float) -> Optional[float]:
         """Position (0..1) of a local point on `side`, or None if it is not on
-        that edge. Mirrors _edge_point_formulas in reverse."""
-        tol = C.SIDE_POINT_TOLERANCE_IN
+        that edge. Mirrors _edge_point_formulas in reverse.
+
+        The perpendicular distance is compared against a fraction of the
+        dimension being crossed (width for left/right, height for
+        bottom/top), so a point near a corner on a large shape is not claimed
+        by the adjacent edge.
+        """
         if side in ("left", "right"):
             edge_x = 0.0 if side == "left" else width
-            if not height or abs(x - edge_x) > tol:
+            if not height or abs(x - edge_x) > VisioClient._side_tolerance(width):
                 return None
             return y / height
         edge_y = 0.0 if side == "bottom" else height
-        if not width or abs(y - edge_y) > tol:
+        if not width or abs(y - edge_y) > VisioClient._side_tolerance(height):
             return None
         return x / width
 
@@ -721,19 +733,23 @@ class VisioClient:
         """(side, pos) for a connection point's local coordinates.
 
         Corner points match two edges; the first in bottom/top/left/right
-        order wins (a corner is reported as bottom/top).
+        order wins (a corner is reported as bottom/top). Near-edge matching
+        uses a per-dimension relative tolerance, so a point on one edge is
+        not misreported as lying on the perpendicular edge merely because it
+        is close to a corner in absolute inches.
         """
-        tol = C.SIDE_POINT_TOLERANCE_IN
         candidates: list[tuple[str, float]] = []
         if width:
-            if abs(y) <= tol:
+            tol_y = VisioClient._side_tolerance(height)
+            if abs(y) <= tol_y:
                 candidates.append(("bottom", x / width))
-            if abs(y - height) <= tol:
+            if abs(y - height) <= tol_y:
                 candidates.append(("top", x / width))
         if height:
-            if abs(x) <= tol:
+            tol_x = VisioClient._side_tolerance(width)
+            if abs(x) <= tol_x:
                 candidates.append(("left", y / height))
-            if abs(x - width) <= tol:
+            if abs(x - width) <= tol_x:
                 candidates.append(("right", y / height))
         return candidates[0] if candidates else (None, None)
 
