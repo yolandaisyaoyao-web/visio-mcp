@@ -40,6 +40,7 @@ if hasattr(sys.stdout, "reconfigure"):
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from visio_mcp import constants as C  # noqa: E402
+from visio_mcp import routing  # noqa: E402
 from visio_mcp.runtime import ComWorker  # noqa: E402
 from visio_mcp.visio_client import VisioClient  # noqa: E402
 
@@ -89,171 +90,10 @@ def on_boundary(point, box, tol=0.05):
             or abs(y - bottom) <= tol or abs(y - top) <= tol)
 
 
-def seg_length(seg):
-    return dist(seg[0], seg[1])
-
-
-def polyline_length(points):
-    return sum(dist(a, b) for a, b in zip(points, points[1:]))
-
-
-def segment_intersection(p1, p2, p3, p4):
-    """Proper intersection point of two segments, or None."""
-    x1, y1 = p1
-    x2, y2 = p2
-    x3, y3 = p3
-    x4, y4 = p4
-    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    if abs(denom) < 1e-12:
-        return None
-    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-    u = ((x1 - x3) * (y1 - y2) - (y1 - y3) * (x1 - x2)) / denom
-    if -1e-9 <= t <= 1 + 1e-9 and -1e-9 <= u <= 1 + 1e-9:
-        return (x1 + t * (x2 - x1), y1 + t * (y2 - y1))
-    return None
-
-
-def _point_seg_dist(point, seg):
-    """Distance from a point to a segment (for endpoint-contact filtering)."""
-    ax, ay = seg[0]
-    bx, by = seg[1]
-    dx, dy = bx - ax, by - ay
-    length2 = dx * dx + dy * dy
-    if length2 <= 1e-12:
-        return dist(point, seg[0])
-    t = max(0.0, min(1.0, ((point[0] - ax) * dx + (point[1] - ay) * dy) / length2))
-    return dist(point, (ax + t * dx, ay + t * dy))
-
-
-def collinear_overlap(seg_a, seg_b, angle_tol=1e-9):
-    """Overlap length of two collinear segments (0 when not collinear)."""
-    (ax1, ay1), (ax2, ay2) = seg_a
-    (bx1, by1), (bx2, by2) = seg_b
-    adx, ady = ax2 - ax1, ay2 - ay1
-    alen = math.hypot(adx, ady)
-    if alen <= 1e-9:
-        return 0.0
-    ux, uy = adx / alen, ady / alen
-    bdx, bdy = bx2 - bx1, by2 - by1
-    blen = math.hypot(bdx, bdy)
-    if blen <= 1e-9:
-        return 0.0
-    # parallel?
-    if abs(ux * bdy - uy * bdx) > angle_tol:
-        return 0.0
-    # same line? distance of b1 from a's line
-    cross = abs((bx1 - ax1) * uy - (by1 - ay1) * ux)
-    if cross > TOL:
-        return 0.0
-    ta1, ta2 = 0.0, alen
-    tb1 = (bx1 - ax1) * ux + (by1 - ay1) * uy
-    tb2 = (bx2 - ax1) * ux + (by2 - ay1) * uy
-    lo, hi = max(min(ta1, ta2), min(tb1, tb2)), min(max(ta1, ta2), max(tb1, tb2))
-    return max(0.0, hi - lo)
-
-
-def segment_inside_rect(p, q, rect, inset=0.02):
-    """Length of the segment strictly inside an inset rectangle (Liang–Barsky)."""
-    left, bottom, right, top = rect
-    left += inset
-    bottom += inset
-    right -= inset
-    top -= inset
-    if right <= left or top <= bottom:
-        return 0.0
-    x0, y0 = p
-    dx, dy = q[0] - x0, q[1] - y0
-    t0, t1 = 0.0, 1.0
-    for edge_p, edge_q in ((-dx, x0 - left), (dx, right - x0),
-                           (-dy, y0 - bottom), (dy, top - y0)):
-        if abs(edge_p) < 1e-12:
-            if edge_q < 0:
-                return 0.0
-        else:
-            t = edge_q / edge_p
-            if edge_p < 0:
-                t0 = max(t0, t)
-            else:
-                t1 = min(t1, t)
-            if t0 > t1:
-                return 0.0
-    return max(0.0, t1 - t0) * math.hypot(dx, dy)
-
-
 def rect_overlap_area(a, b):
     w = min(a[2], b[2]) - max(a[0], b[0])
     h = min(a[3], b[3]) - max(a[1], b[1])
     return max(0.0, w) * max(0.0, h)
-
-
-# ---------------------------------------------------------------------------
-# COM-side extraction
-# ---------------------------------------------------------------------------
-
-
-def connector_polyline(conn):
-    """Routed polyline in page coordinates.
-
-    A connector's Geometry1 rows are standard shape-local coordinates:
-    page = Pin - LocPin + local (angle 0, no flip). The local origin is NOT
-    the begin point — on a vertical connector Width is a nominal 5 mm and
-    LocPinX is that half-width, so the rows carry a 0.098 in offset that
-    only the standard transform removes. Returns (points, ok); ok is False
-    when the route is rotated/flipped or the first/last vertex does not
-    land on Begin/End, in which case the caller falls back to a straight
-    Begin->End segment.
-    """
-    begin = (float(conn.CellsU("BeginX").ResultIU),
-             float(conn.CellsU("BeginY").ResultIU))
-    end = (float(conn.CellsU("EndX").ResultIU),
-           float(conn.CellsU("EndY").ResultIU))
-    points = []
-    try:
-        pin = (float(conn.CellsU("PinX").ResultIU),
-               float(conn.CellsU("PinY").ResultIU))
-        locpin = (float(conn.CellsU("LocPinX").ResultIU),
-                  float(conn.CellsU("LocPinY").ResultIU))
-        angle = float(conn.CellsU("Angle").ResultIU)
-        flipx = int(conn.CellsU("FlipX").ResultIU)
-        flipy = int(conn.CellsU("FlipY").ResultIU)
-        sec = C.VIS_SECTION_FIRST_COMPONENT
-        for row in range(1, int(conn.RowCount(sec))):
-            dx = float(conn.CellsSRC(sec, row, C.VIS_GEOM_X).ResultIU)
-            dy = float(conn.CellsSRC(sec, row, C.VIS_GEOM_Y).ResultIU)
-            points.append((pin[0] - locpin[0] + dx,
-                           pin[1] - locpin[1] + dy))
-    except Exception:
-        return [begin, end], False
-    if (len(points) < 2 or abs(angle) > 1e-6 or flipx or flipy
-            or dist(points[0], begin) > 0.05 or dist(points[-1], end) > 0.05):
-        return [begin, end], False
-    return points, True
-
-
-def connector_label_rect(conn):
-    text = str(conn.Text or "").strip()
-    if not text:
-        return None
-    px = float(conn.CellsU("PinX").ResultIU)
-    py = float(conn.CellsU("PinY").ResultIU)
-    lx = float(conn.CellsU("LocPinX").ResultIU)
-    ly = float(conn.CellsU("LocPinY").ResultIU)
-    tx = float(conn.CellsU("TxtPinX").ResultIU)
-    ty = float(conn.CellsU("TxtPinY").ResultIU)
-    tw = float(conn.CellsU("TxtWidth").ResultIU)
-    th = float(conn.CellsU("TxtHeight").ResultIU)
-    cx, cy = px - lx + tx, py - ly + ty
-    return (cx - tw / 2, cy - th / 2, cx + tw / 2, cy + th / 2)
-
-
-def shape_text_rect(info):
-    """Approximate text area: the node box inset, or the label box itself."""
-    box = (info["x"] - info["width_in"] / 2, info["y"] - info["height_in"] / 2,
-           info["x"] + info["width_in"] / 2, info["y"] + info["height_in"] / 2)
-    if info.get("is_text"):
-        return box
-    inset = min(0.06, info["width_in"] * 0.15, info["height_in"] * 0.15)
-    return (box[0] + inset, box[1] + inset, box[2] - inset, box[3] - inset)
 
 
 # ---------------------------------------------------------------------------
@@ -574,133 +414,108 @@ def analyze_stage(client, page, spec, built, stage):
     add_check(checks, "重叠", "节点矩形互不重叠", not overlaps,
               f"重叠对: {overlaps}" if overlaps else "无节点重叠", quality=True)
 
-    # -- polylines -----------------------------------------------------------
+    # -- polylines + quality diagnostics (shared with route_diagnostics) ------
     polylines = {}
     fallback = []
+    connector_diag = {}
     for cid, info in conn_infos.items():
-        points, ok = connector_polyline(page.Shapes.ItemFromID(cid))
+        points, ok = client._connector_polyline(page.Shapes.ItemFromID(cid))
         polylines[cid] = points
         if not ok:
             fallback.append(cid)
+        connector_diag[cid] = {
+            "from_id": info["from_id"],
+            "to_id": info["to_id"],
+            "points": points,
+        }
     metrics["geometry_fallback_connectors"] = fallback
 
-    # connector-connector crossings
-    crossings = []
+    node_rects = {
+        sid: box for sid, box, sinfo in node_boxes
+        if not sinfo.get("is_container")
+    }
+    label_rects = {}
+    for cid in polylines:
+        rect = client._connector_label_rect(page.Shapes.ItemFromID(cid))
+        if rect is not None:
+            label_rects[cid] = rect
+    report = routing.diagnose_routes(
+        connector_diag, node_rects, label_rects,
+        endpoint_eps=END_EPS, overlap_min=OVERLAP_MIN, inside_min=INSIDE_MIN,
+        node_inset=C.ROUTE_NODE_INSET_IN,
+        label_area_min=C.ROUTE_LABEL_AREA_MIN_IN2,
+        detour_ratio=2.0,
+    )
     cids = sorted(polylines)
-    for i in range(len(cids)):
-        for j in range(i + 1, len(cids)):
-            ca, cb = cids[i], cids[j]
-            found = None
-            for sa in zip(polylines[ca], polylines[ca][1:]):
-                if seg_length(sa) < 1e-6:
-                    continue
-                for sb in zip(polylines[cb], polylines[cb][1:]):
-                    if seg_length(sb) < 1e-6:
-                        continue
-                    point = segment_intersection(*sa, *sb)
-                    if point is None:
-                        continue
-                    if (min(_point_seg_dist(point, sa), _point_seg_dist(point, sb))
-                            <= END_EPS):
-                        continue
-                    found = (ca, cb, round(point[0], 2), round(point[1], 2))
-                    break
-                if found:
-                    break
-            if found:
-                crossings.append(found)
+
+    crossings = []
+    seen_cross = set()
+    for cid in cids:
+        for entry in report["connectors"][cid]["crossings"]:
+            key = tuple(sorted((cid, entry["connector_id"])))
+            if key in seen_cross:
+                continue
+            seen_cross.add(key)
+            crossings.append((key[0], key[1], entry["at"][0], entry["at"][1]))
     metrics["crossings"] = crossings
     add_check(checks, "交叉", "连接线之间无交叉", not crossings,
               f"交叉 {len(crossings)} 处: {crossings}" if crossings else "无交叉",
               quality=True)
 
-    # collinear overlaps
     overlap_pairs = []
-    for i in range(len(cids)):
-        for j in range(i + 1, len(cids)):
-            ca, cb = cids[i], cids[j]
-            longest = 0.0
-            for sa in zip(polylines[ca], polylines[ca][1:]):
-                for sb in zip(polylines[cb], polylines[cb][1:]):
-                    longest = max(longest, collinear_overlap(sa, sb))
-            if longest > OVERLAP_MIN:
-                overlap_pairs.append((ca, cb, round(longest, 2)))
+    seen_overlap = set()
+    for cid in cids:
+        for entry in report["connectors"][cid]["overlaps"]:
+            key = tuple(sorted((cid, entry["connector_id"])))
+            if key in seen_overlap:
+                continue
+            seen_overlap.add(key)
+            overlap_pairs.append((key[0], key[1], entry["length_in"]))
     metrics["overlaps"] = overlap_pairs
     add_check(checks, "重叠", "连接线之间无共线重叠", not overlap_pairs,
               f"重叠 {overlap_pairs}" if overlap_pairs else "无共线重叠",
               quality=True)
 
-    # segments cutting through other nodes (text occlusion risk)
     through = []
-    for cid, points in polylines.items():
-        info = conn_infos[cid]
-        endpoints = {info["from_id"], info["to_id"]}
-        for sid, box, sinfo in node_boxes:
-            if sid in endpoints:
-                continue
-            if not sinfo.get("text"):
-                continue
-            text_rect = shape_text_rect(sinfo)
-            for seg in zip(points, points[1:]):
-                inside = segment_inside_rect(*seg, text_rect)
-                if inside > INSIDE_MIN:
-                    through.append((cid, sid, round(inside, 2)))
-                    break
+    for cid in cids:
+        for entry in report["connectors"][cid]["through_shapes"]:
+            through.append((cid, entry["shape_id"], entry["length_in"]))
     metrics["through_nodes"] = through
     add_check(checks, "文字遮挡", "连接线不穿越其他节点文字区", not through,
               f"穿越 {through}" if through else "无穿越节点文字区的线段",
               quality=True)
 
-    # connector labels overlapping nodes / other connectors
     label_issues = []
     for cid in cids:
-        conn = page.Shapes.ItemFromID(cid)
-        label_rect = connector_label_rect(conn)
-        if label_rect is None:
-            continue
-        for sid, box, sinfo in node_boxes:
-            if not sinfo.get("text"):
-                continue
-            area = rect_overlap_area(label_rect, shape_text_rect(sinfo))
-            if area > 0.02:
-                label_issues.append((cid, "节点", sid, round(area, 2)))
-        for other in cids:
-            if other == cid:
-                continue
-            for seg in zip(polylines[other], polylines[other][1:]):
-                inside = segment_inside_rect(*seg, label_rect, inset=0.0)
-                if inside > 0.05:
-                    label_issues.append((cid, "连接线", other, round(inside, 2)))
-                    break
+        for entry in report["connectors"][cid]["label_conflicts"]:
+            label_issues.append((
+                cid,
+                "连接线" if entry["kind"] == "connector" else "节点",
+                entry["id"],
+                entry.get("length_in", entry.get("area_in2")),
+            ))
     metrics["label_issues"] = label_issues
     add_check(checks, "文字遮挡", "连接线标签不被节点/其他线遮挡", not label_issues,
               f"标签冲突 {label_issues}" if label_issues else "标签区域清晰",
               quality=True)
 
-    # -- detour / route metrics ---------------------------------------------
-    detours = []
     route_stats = []
-    for cid, points in polylines.items():
+    detours = []
+    for cid in cids:
+        data = report["connectors"][cid]
         info = conn_infos[cid]
-        begin = points[0]
-        end = points[-1]
-        route = polyline_length(points)
-        # Euclidean straight-line distance: a right-angle route's Manhattan
-        # length equals its no-backtracking ideal, so Manhattan hides long
-        # up-and-over detours; the straight-line ratio exposes them.
-        straight = dist(begin, end)
-        ratio = route / straight if straight > 1e-6 else float("inf")
+        ratio = data["detour_ratio"]
         route_stats.append((cid, info["from_id"], info["to_id"],
-                            round(route, 2), round(ratio, 2)))
-        if ratio > 2.0:
+                            data["route_length"], ratio))
+        if ratio is not None and ratio > 2.0:
             detours.append((cid, info["from_id"], info["to_id"],
-                            round(route, 2), round(ratio, 2)))
+                            data["route_length"], ratio))
     metrics["detours"] = detours
     metrics["route_stats"] = route_stats
     add_check(checks, "绕行", "路径长度不过度绕行 (<=2x 直线距离)", not detours,
               f"严重绕行 {detours}" if detours else
               f"无超过 2x 直线距离的绕行；最大 "
-              f"{max((r[4] for r in route_stats), default=0):.2f}x",
+              f"{max((r[4] for r in route_stats if r[4] is not None), default=0):.2f}x",
               quality=True)
 
     metrics["connectors"] = {
@@ -714,7 +529,7 @@ def analyze_stage(client, page, spec, built, stage):
             "label": info.get("text"),
             "label_rect": (
                 [round(v, 3) for v in label_rect]
-                if (label_rect := connector_label_rect(
+                if (label_rect := client._connector_label_rect(
                     page.Shapes.ItemFromID(cid))) else None
             ),
             "points": [(round(x, 3), round(y, 3)) for x, y in polylines[cid]],
@@ -820,20 +635,46 @@ def analyzer_selftest():
         checks.append({"area": "分析器自检", "item": item, "ok": bool(ok),
                        "detail": detail, "method": "自动", "quality": False})
 
-    point = segment_intersection((0, 0), (2, 2), (0, 2), (2, 0))
-    check("两线相交检测", point is not None
-          and abs(point[0] - 1) < 1e-9 and abs(point[1] - 1) < 1e-9,
-          f"交点={point}")
-    point = segment_intersection((0, 0), (2, 0), (0, 1), (2, 1))
-    check("平行线不误报相交", point is None, f"交点={point}")
-    length = collinear_overlap(((0, 0), (2, 0)), ((1, 0), (3, 0)))
-    check("共线重叠长度", abs(length - 1.0) < 1e-9, f"重叠={length}")
-    length = collinear_overlap(((0, 0), (2, 0)), ((0, 1), (2, 1)))
-    check("平行不共线不误报重叠", length == 0.0, f"重叠={length}")
-    inside = segment_inside_rect((0, 0.5), (2, 0.5), (0.5, 0, 1.5, 1), inset=0.0)
-    check("线段穿越矩形长度", abs(inside - 1.0) < 1e-9, f"穿越长度={inside}")
-    inside = segment_inside_rect((0, 0), (2, 0), (0.5, 0, 1.5, 1))
-    check("贴边线段不计入穿越", inside == 0.0, f"穿越长度={inside}")
+    def report(**connectors):
+        return routing.diagnose_routes(connectors, {})
+
+    crossing = report(
+        a={"from_id": 1, "to_id": 2, "points": [(0, 0), (2, 2)]},
+        b={"from_id": 3, "to_id": 4, "points": [(0, 2), (2, 0)]},
+    )
+    check("两线相交检测", crossing["summary"]["crossing_count"] == 1,
+          f"交叉数={crossing['summary']['crossing_count']}")
+    parallel = report(
+        a={"from_id": 1, "to_id": 2, "points": [(0, 0), (2, 0)]},
+        b={"from_id": 3, "to_id": 4, "points": [(0, 1), (2, 1)]},
+    )
+    check("平行线不误报相交", parallel["summary"]["crossing_count"] == 0,
+          f"交叉数={parallel['summary']['crossing_count']}")
+    overlap = report(
+        a={"from_id": 1, "to_id": 2, "points": [(0, 0), (2, 0)]},
+        b={"from_id": 3, "to_id": 4, "points": [(1, 0), (3, 0)]},
+    )
+    check("共线重叠检测", overlap["summary"]["overlap_count"] == 1
+          and overlap["connectors"]["a"]["overlaps"][0]["length_in"] == 1.0,
+          str(overlap["connectors"]["a"]["overlaps"]))
+    no_overlap = report(
+        a={"from_id": 1, "to_id": 2, "points": [(0, 0), (2, 0)]},
+        b={"from_id": 3, "to_id": 4, "points": [(0, 1), (2, 1)]},
+    )
+    check("平行不共线不误报重叠", no_overlap["summary"]["overlap_count"] == 0,
+          f"重叠数={no_overlap['summary']['overlap_count']}")
+    through = routing.diagnose_routes(
+        {"a": {"from_id": 1, "to_id": 2, "points": [(0, 0.5), (2, 0.5)]}},
+        {9: (0.5, 0, 1.5, 1)},
+    )
+    check("线段穿越节点检测", through["summary"]["through_shape_count"] == 1,
+          str(through["connectors"]["a"]["through_shapes"]))
+    hugging = routing.diagnose_routes(
+        {"a": {"from_id": 1, "to_id": 2, "points": [(0, 0), (2, 0)]}},
+        {9: (0.5, 0, 1.5, 1)},
+    )
+    check("贴边线段不计入穿越", hugging["summary"]["through_shape_count"] == 0,
+          str(hugging["connectors"]["a"]["through_shapes"]))
     return checks
 
 

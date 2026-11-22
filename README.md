@@ -80,7 +80,10 @@ Then ask Claude something like: *"Draw a 5-step login flowchart in Visio and sho
 | `find_masters` | Search droppable shapes across open stencils |
 | `drop_shape` / `drop_shapes` | Drop masters at (x, y) inches with optional text/size |
 | `update_shape` / `style_shape` / `delete_shapes` | Edit text/position/size, colors/fonts, delete |
-| `connect_shapes` | Glued connector: label, arrows, right-angle/straight/curved routing, solid/dashed/dotted patterns, weight, color, optional `from_side`/`to_side` (`auto`/`top`/`bottom`/`left`/`right`) to pin endpoints for loop-backs and branches, and `from_pos`/`to_pos` (0..1) for the exact point along an edge (auto-spaced when omitted) |
+| `connect_shapes` | Glued connector: label, arrows, right-angle/straight/curved routing, solid/dashed/dotted patterns, weight, color, optional `from_side`/`to_side` (`auto`/`top`/`bottom`/`left`/`right`) to pin endpoints for loop-backs and branches, `from_pos`/`to_pos` (0..1) for the exact point along an edge (auto-spaced when omitted), and optional `waypoints` / `label_pos` / `label_offset_in` for route control |
+| `set_connector_route` | Give an existing connector explicit page-coordinate `waypoints` (native 1-D route, up to 8) and/or move its label along the route; a dynamic connector is converted while keeping endpoints, glue, arrows, style and text |
+| `route_diagnostics` | Read-only routing report: per-connector page polyline, length/detour ratio, crossings, collinear overlaps, node traversal and label conflicts, with ids and exact locations |
+| `set_route_options` | Native page-level lane separation (`LineAdjustFrom=1`, `LineAdjustTo=2`) that keeps different connectors out of one lane without moving shapes |
 | `add_container` / `container_members` | Wrap shapes in real Visio containers (VNets, VPCs, subnets, trust zones) — members move with the container |
 | `drop_text` | Text-only labels (no border/fill) for titles, legends, and callouts |
 | `set_page_size` | Resize the page (or fit to contents) — do this before wide architecture diagrams |
@@ -91,6 +94,8 @@ Then ask Claude something like: *"Draw a 5-step login flowchart in Visio and sho
 **Coordinate system**: inches, origin at the page **bottom-left**, y grows upward, and drop coordinates are the shape's **center**. Rough placement is fine — finish with `auto_layout`. The default page is US Letter (8.5×11): call `set_page_size` first for wide architecture diagrams, since PNG export crops to the page bounds.
 
 **Connector endpoints**: `connect_shapes` uses Visio's dynamic glue by default (`from_side`/`to_side` = `auto`), so Visio re-picks the best sides as shapes move. For algorithm flowcharts, pin the sides of loop-back and multi-branch edges so lines don't wrap around shapes or overlap: e.g. `connect_shapes(loop_id, cond_id, from_side="right", to_side="right")` keeps a clean loop on the right. When several connectors share one edge, each new endpoint is auto-slotted into the widest free gap with at least 0.15 in between points (the first uses the midpoint); a short, crowded edge errors rather than packing points together. Pass `from_pos`/`to_pos` to place one exactly: a fraction strictly between 0 and 1 (left/right run bottom→top, top/bottom run left→right). 0 and 1 are corners shared by two edges, so they are rejected as ambiguous — use e.g. 0.01/0.99 or the adjacent side. A pinned endpoint still follows its shape and re-routes when the page layout changes — it keeps the chosen edge and position. `get_page_state` reports each connector end's glue kind, edge, position and connection-point row.
+
+**Route control**: when Visio's automatic router produces a shared lane or a label collision, `route_diagnostics` reports the exact connector ids, segments and label rectangles. `set_route_options` turns on native lane separation for short merge trunks; `set_connector_route` (or `connect_shapes(..., waypoints=[[x, y], ...])`) pins a route to explicit page-coordinate corridors. Route-controlled connectors are native 1-D lines with static glue, normal arrowheads/text, and page-anchored geometry formulas: the waypoints stay put when nodes move or the file is reopened, while the endpoints keep following their glued connection points. Labels use Visio's `POINTALONGPATH` with `label_pos` (0..1 along the route) and `label_offset_in` (positive = left of travel). Dynamic connectors remain the default; without `waypoints` nothing changes.
 
 ## Architecture
 
@@ -116,6 +121,8 @@ uv run pytest
 ```
 
 Real-Visio connector verification (Windows + Visio desktop): `uv run python scripts/verify_connector_sides.py` — checks pinned sides, dynamic glue, node moves, auto-layout, save/reopen, and exports a PNG.
+
+Route-control acceptance (real Visio): `uv run python scripts/verify_route_control.py` — creates a page-anchored manual route, converts a dynamic connector, removes the B/C short overlaps with native lane separation, and removes the TDMA 6.5 in overlay + label conflict with fixed corridors; writes `*-route-controlled.vsdx`/PNG and `route-control-data.json` under `D:\桌面\test\visio-mcp-regression`.
 
 ## Troubleshooting
 

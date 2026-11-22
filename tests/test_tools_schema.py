@@ -1,4 +1,4 @@
-"""The 23 MCP tools register with correct names and schemas."""
+"""The 26 MCP tools register with correct names and schemas."""
 
 import sys
 
@@ -22,6 +22,9 @@ EXPECTED_TOOLS = {
     "style_shape",
     "delete_shapes",
     "connect_shapes",
+    "set_connector_route",
+    "set_route_options",
+    "route_diagnostics",
     "pages",
     "auto_layout",
     "get_page_state",
@@ -37,7 +40,7 @@ async def test_all_tools_registered():
     tools = await server.mcp.list_tools()
     names = {t.name for t in tools}
     assert names == EXPECTED_TOOLS
-    assert len(EXPECTED_TOOLS) == 23
+    assert len(EXPECTED_TOOLS) == 26
 
 
 async def test_every_tool_has_description_mentioning_behavior():
@@ -93,6 +96,38 @@ async def test_connect_shapes_edge_position_params():
         # Optional[float] -> number-or-null
         types = {entry.get("type") for entry in prop.get("anyOf", [prop])}
         assert "number" in types and "null" in types, name
+
+
+async def test_connect_shapes_route_control_params():
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    schema = tools["connect_shapes"].inputSchema
+    for name in ("waypoints", "label_pos", "label_offset_in"):
+        prop = schema["properties"][name]
+        assert prop.get("default") is None, name
+
+
+async def test_set_connector_route_schema():
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    schema = tools["set_connector_route"].inputSchema
+    assert set(schema["required"]) == {"connector_id"}
+    for name in ("waypoints", "label_pos", "label_offset_in", "page"):
+        assert name in schema["properties"], name
+        assert schema["properties"][name].get("default") is None, name
+
+
+async def test_route_diagnostics_takes_optional_page():
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    schema = tools["route_diagnostics"].inputSchema
+    assert schema.get("required", []) == []
+    assert "page" in schema["properties"]
+
+
+async def test_set_route_options_schema():
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    schema = tools["set_route_options"].inputSchema
+    assert schema.get("required", []) == []
+    assert schema["properties"]["separate_lanes"].get("default") is True
+    assert schema["properties"]["page"].get("default") is None
 
 
 async def test_add_container_requires_label_and_members():

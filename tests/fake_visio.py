@@ -12,6 +12,7 @@ COM collections are 1-based (Count/Item), matching how VisioClient iterates.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 
@@ -169,6 +170,57 @@ class FakeConnPt:
         return self.x if int(column) == 0 else self.y
 
 
+_ANCHOR_X_RE = re.compile(
+    r"^\(\((?P<x>[-0-9.]+) in-BeginX\)\*\(EndX-BeginX\)"
+    r"\+\((?P<y>[-0-9.]+) in-BeginY\)\*\(EndY-BeginY\)\)/Width$"
+)
+_ANCHOR_Y_RE = re.compile(
+    r"^\(\(EndX-BeginX\)\*\((?P<y>[-0-9.]+) in-BeginY\)"
+    r"-\(EndY-BeginY\)\*\((?P<x>[-0-9.]+) in-BeginX\)\)/Width$"
+)
+
+
+class FakeGeomCell(FakeConnPtCell):
+    """Geometry cell that also evaluates the page-anchored formulas.
+
+    The formulas are exactly the ones VisioClient._manual_local_formulas
+    writes, so fake-side route diagnostics see the same page polyline as
+    real Visio.
+    """
+
+    @property
+    def ResultIU(self):
+        formula = str(self._formula)
+        begin_x = float(self.shape.CellsU("BeginX").ResultIU)
+        begin_y = float(self.shape.CellsU("BeginY").ResultIU)
+        end_x = float(self.shape.CellsU("EndX").ResultIU)
+        end_y = float(self.shape.CellsU("EndY").ResultIU)
+        width = float(self.shape.CellsU("Width").ResultIU) or 1.0
+        match = _ANCHOR_X_RE.match(formula)
+        if match:
+            px, py = float(match.group("x")), float(match.group("y"))
+            return ((px - begin_x) * (end_x - begin_x)
+                    + (py - begin_y) * (end_y - begin_y)) / width
+        match = _ANCHOR_Y_RE.match(formula)
+        if match:
+            px, py = float(match.group("x")), float(match.group("y"))
+            return ((end_x - begin_x) * (py - begin_y)
+                    - (end_y - begin_y) * (px - begin_x)) / width
+        return super().ResultIU
+
+
+class FakeGeomRow:
+    """One geometry vertex row (X and Y cells)."""
+
+    def __init__(self, shape, row_type, x_formula="0", y_formula="0"):
+        self.row_type = int(row_type)
+        self.x = FakeGeomCell(shape, "Geometry.X", x_formula)
+        self.y = FakeGeomCell(shape, "Geometry.Y", y_formula)
+
+    def cell(self, column):
+        return self.x if int(column) == 0 else self.y
+
+
 class FakeLocPinCell:
     """LocPin defaults to the shape center via formula in real Visio: track
     Width/Height unless explicitly overridden."""
@@ -215,6 +267,8 @@ class FakeShape:
         self.connects: list[FakeConnect] = []
         self.member_of: list[int] = []
         self.conn_pts: list[FakeConnPt] = []
+        self.geom_rows: list[FakeGeomRow] = []
+        self._user_rows: set[str] = set()
         self.ContainerProperties = None
         self._cells: dict[str, FakeCell] = {}
         self.CellsU("PinX").ResultIU = x
@@ -232,22 +286,107 @@ class FakeShape:
 
     # -- Connection Points section (section 7) ------------------------------
 
+    @property
+    def GeometryCount(self):
+        return 1 if self.geom_rows else 0
+
     def RowCount(self, section):
-        return len(self.conn_pts) if int(section) == 7 else 0
+        section = int(section)
+        if section == 7:
+            return len(self.conn_pts)
+        if section == 10:
+            return len(self.geom_rows)
+        return 0
+
+    def RowType(self, section, row):
+        if int(section) == 10:
+            return self.geom_rows[int(row)].row_type
+        return 0
 
     def CellsSRC(self, section, row, column):
-        if int(section) != 7:
-            raise com_error(-2147352567, f"section {section} not modeled")
+        section = int(section)
         row = int(row)
-        if not 0 <= row < len(self.conn_pts):
-            raise com_error(-2147352567, f"no connection point row {row}")
-        return self.conn_pts[row].cell(column)
+        if section == 7:
+            if not 0 <= row < len(self.conn_pts):
+                raise com_error(-2147352567, f"no connection point row {row}")
+            return self.conn_pts[row].cell(column)
+        if section == 10:
+            if not 0 <= row < len(self.geom_rows):
+                raise com_error(-2147352567, f"no geometry row {row}")
+            return self.geom_rows[row].cell(column)
+        raise com_error(-2147352567, f"section {section} not modeled")
 
     def AddRow(self, section, row, tag):
-        if int(section) != 7:
-            raise com_error(-2147352567, f"AddRow not modeled for section {section}")
-        self.conn_pts.append(FakeConnPt(self, len(self.conn_pts) + 1))
-        return len(self.conn_pts) - 1
+        section = int(section)
+        if section == 7:
+            self.conn_pts.append(FakeConnPt(self, len(self.conn_pts) + 1))
+            return len(self.conn_pts) - 1
+        if section == 10:
+            row_type = int(tag) if int(tag) else 139
+            geom = FakeGeomRow(self, row_type)
+            row = int(row)
+            if row < 0 or row >= len(self.geom_rows):
+                self.geom_rows.append(geom)
+                return len(self.geom_rows) - 1
+            self.geom_rows.insert(row, geom)
+            return row
+        raise com_error(-2147352567, f"AddRow not modeled for section {section}")
+
+    def AddRows(self, section, row, tag, count):
+        last = None
+        for _ in range(int(count)):
+            last = self.AddRow(section, row, tag)
+        return last
+
+    def DeleteRow(self, section, row):
+        section = int(section)
+        row = int(row)
+        if section == 7 and 0 <= row < len(self.conn_pts):
+            self.conn_pts.pop(row)
+            return
+        if section == 10 and 0 <= row < len(self.geom_rows):
+            self.geom_rows.pop(row)
+            return
+        raise com_error(-2147352567, f"no row {row} in section {section}")
+
+    def AddNamedRow(self, section, row_name, tag):
+        if int(section) == 242:
+            self._user_rows.add(str(row_name))
+            self.CellsU(f"User.{row_name}")
+            return 0
+        raise com_error(-2147352567, f"AddNamedRow not modeled for section {section}")
+
+    def CellExistsU(self, name, f_exists_locally=0):
+        if str(name).startswith("User."):
+            return 1 if str(name)[5:] in self._user_rows else 0
+        return 1 if str(name) in self._cells else 0
+
+    def XYToPage(self, x, y):
+        px = float(self.CellsU("PinX").ResultIU)
+        py = float(self.CellsU("PinY").ResultIU)
+        lx = float(self.CellsU("LocPinX").ResultIU)
+        ly = float(self.CellsU("LocPinY").ResultIU)
+        angle = float(self.CellsU("Angle").ResultIU)
+        flipx = -1.0 if float(self.CellsU("FlipX").ResultIU) else 1.0
+        flipy = -1.0 if float(self.CellsU("FlipY").ResultIU) else 1.0
+        dx = (float(x) - lx) * flipx
+        dy = (float(y) - ly) * flipy
+        ca, sa = math.cos(angle), math.sin(angle)
+        return (px + dx * ca - dy * sa, py + dx * sa + dy * ca)
+
+    def XYFromPage(self, px, py):
+        pinx = float(self.CellsU("PinX").ResultIU)
+        piny = float(self.CellsU("PinY").ResultIU)
+        lx = float(self.CellsU("LocPinX").ResultIU)
+        ly = float(self.CellsU("LocPinY").ResultIU)
+        angle = float(self.CellsU("Angle").ResultIU)
+        flipx = -1.0 if float(self.CellsU("FlipX").ResultIU) else 1.0
+        flipy = -1.0 if float(self.CellsU("FlipY").ResultIU) else 1.0
+        dx, dy = float(px) - pinx, float(py) - piny
+        ca, sa = math.cos(-angle), math.sin(-angle)
+        rx = dx * ca - dy * sa
+        ry = dx * sa + dy * ca
+        return (lx + rx * flipx, ly + ry * flipy)
 
     @property
     def Connects(self):
@@ -342,6 +481,33 @@ class FakePage:
         shape.NameU = f"Sheet.{shape.ID}"
         shape.CellsU("Width").ResultIU = abs(x2 - x1)
         shape.CellsU("Height").ResultIU = abs(y2 - y1)
+        self.shapes.append(shape)
+        return shape
+
+    def DrawLine(self, x1, y1, x2, y2):
+        """A 1-D line shape with a normal local frame (like Visio)."""
+        shape = FakeShape(self, self._next_id, master=None,
+                          x=(x1 + x2) / 2, y=(y1 + y2) / 2)
+        self._next_id += 1
+        shape.OneD = 1
+        shape.NameU = f"Sheet.{shape.ID}"
+        length = math.hypot(x2 - x1, y2 - y1)
+        shape.CellsU("BeginX").ResultIU = x1
+        shape.CellsU("BeginY").ResultIU = y1
+        shape.CellsU("EndX").ResultIU = x2
+        shape.CellsU("EndY").ResultIU = y2
+        shape.CellsU("Width").ResultIU = length
+        shape.CellsU("Height").ResultIU = 0.0
+        shape.CellsU("LocPinX").ResultIU = length / 2.0
+        shape.CellsU("LocPinY").ResultIU = 0.0
+        shape.CellsU("Angle").ResultIU = math.atan2(y2 - y1, x2 - x1)
+        shape.CellsU("FlipX").ResultIU = 0
+        shape.CellsU("FlipY").ResultIU = 0
+        shape.geom_rows = [
+            FakeGeomRow(shape, 137, "1", "0"),
+            FakeGeomRow(shape, 138, "Width*0", "0 mm"),
+            FakeGeomRow(shape, 139, "Width*1", "0 mm"),
+        ]
         self.shapes.append(shape)
         return shape
 

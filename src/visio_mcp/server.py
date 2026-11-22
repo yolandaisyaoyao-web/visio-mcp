@@ -48,6 +48,14 @@ mcp = FastMCP(
         "Several connectors on one edge are auto-spaced into free slots; use "
         "from_pos/to_pos (0..1) to place one exactly. get_page_state reports "
         "each connector end's glue kind, edge, position and point row. "
+        "When Visio's router shares a lane or a label collides, call "
+        "route_diagnostics (read-only): it reports the polyline, crossings, "
+        "overlaps, node traversal and label conflicts with ids and points. "
+        "Fix short merge trunks with set_route_options(separate_lanes=True); "
+        "pin exact corridors with connect_shapes(waypoints=...) or "
+        "set_connector_route on an existing connector (native 1-D line, "
+        "endpoints stay glued). Place labels with POINTALONGPATH via "
+        "label_pos/label_offset_in. Dynamic routing remains the default. "
         "For Azure/"
         "AWS icons, Visio ships built-in cloud stencils — visio_status lists "
         "them in builtin_cloud_stencils and they open by bare filename (e.g. "
@@ -357,6 +365,9 @@ async def connect_shapes(
     to_side: Literal["auto", "top", "bottom", "left", "right"] = "auto",
     from_pos: Optional[float] = None,
     to_pos: Optional[float] = None,
+    waypoints: Optional[list[list[float]]] = None,
+    label_pos: Optional[float] = None,
+    label_offset_in: Optional[float] = None,
 ) -> dict:
     """Connect two shapes with a connector glued to both. With the default
     from_side='auto' / to_side='auto' the connector uses Visio's dynamic glue:
@@ -386,12 +397,78 @@ async def connect_shapes(
             crowded edge errors instead of packing points together. Requires
             an explicit from_side.
         to_pos: Same for the to_side edge.
+        waypoints: Optional page-coordinate [x, y] points (inches, origin
+            bottom-left) the route must pass through. Supplying this creates
+            a native 1-D route-controlled line instead of Visio's dynamic
+            connector: explicit from_side/to_side are required, endpoints stay
+            statically glued, and the points stay at their page positions
+            when shapes move or the file is reopened. The first/last segments
+            still leave/enter perpendicular to the pinned sides; between
+            waypoints the route is orthogonal. No obstacle avoidance is done.
+        label_pos: Optional 0..1 position along the routed path for the label
+            (0 = begin, 1 = end). Works on dynamic and route-controlled
+            connectors; the label stays at that absolute page point.
+        label_offset_in: Optional perpendicular label offset in inches
+            (positive = left of the direction of travel).
     """
     return await _worker.run(
         _client.connect_shapes, from_id, to_id, label, route,
         end_arrow, begin_arrow, page, line_pattern, line_weight_pt, line_color,
         from_side, to_side, from_pos, to_pos,
+        waypoints, label_pos, label_offset_in,
     )
+
+
+@mcp.tool()
+@_tool_errors
+async def set_connector_route(
+    connector_id: int,
+    waypoints: Optional[list[list[float]]] = None,
+    label_pos: Optional[float] = None,
+    label_offset_in: Optional[float] = None,
+    page: Optional[str] = None,
+) -> dict:
+    """Change an existing connector's route and/or label position.
+
+    With waypoints, a dynamic connector is replaced by a native 1-D
+    route-controlled line preserving endpoints, sides, positions, arrows and
+    line style; an existing manual route is rewritten in place. Without
+    waypoints only the label moves. Pass [] to give a connector a default
+    orthogonal route with no extra bends beyond the side stubs.
+
+    Args:
+        connector_id: The connector shape to adjust.
+        waypoints: Page-coordinate [x, y] points (inches, bottom-left origin),
+            at most 8. Requires a connector statically glued on both ends
+            (from_side/to_side); dynamic-glue connectors are rejected.
+        label_pos: Optional 0..1 position along the routed path for the label.
+        label_offset_in: Optional perpendicular offset in inches (positive =
+            left of travel).
+    """
+    return await _worker.run(
+        _client.set_connector_route, connector_id, waypoints,
+        label_pos, label_offset_in, page,
+    )
+
+
+@mcp.tool()
+@_tool_errors
+async def set_route_options(
+    separate_lanes: bool = True,
+    page: Optional[str] = None,
+) -> dict:
+    """Turn on native page-level connector lane separation.
+
+    Sets the page layout cells LineAdjustFrom=1 (separate all lines) and
+    LineAdjustTo=2 (never overlap lines). Visio's router then keeps different
+    connectors out of the same lane, which removes short merge trunks and
+    long co-linear overlaps without changing any connector's endpoints or
+    glue. Pass separate_lanes=False to restore the page defaults. Use
+    route_diagnostics to verify the result; manual routes via
+    set_connector_route keep exact corridors where the heuristic is not
+    enough.
+    """
+    return await _worker.run(_client.set_route_options, separate_lanes, page)
 
 
 @mcp.tool()
@@ -542,9 +619,29 @@ async def get_page_state(page: Optional[str] = None) -> dict:
     membership (container_ids). Connectors also report how each end is glued:
     'dynamic' (Visio picks the side) or 'static' (a connection point), with
     the edge (from_side/to_side), the position along it (from_pos/to_pos,
-    0..1) and the 1-based connection-point row (from_point/to_point). Call
-    this to (re)discover shape ids, e.g. after open_document."""
+    0..1) and the 1-based connection-point row (from_point/to_point), plus
+    route_kind ('auto' dynamic connector or 'manual' route-controlled line).
+    Call this to (re)discover shape ids, e.g. after open_document."""
     return await _worker.run(_client.get_page_state, page)
+
+
+@mcp.tool()
+@_tool_errors
+async def route_diagnostics(page: Optional[str] = None) -> dict:
+    """Read-only routing quality report for a page. No shapes are changed.
+
+    For every connector it returns the actual routed polyline in page inches,
+    route length, straight-line length and detour ratio, plus precise
+    locations of:
+      - crossings with other connectors (connector ids + page point),
+      - collinear overlaps with other connectors (id + overlap length +
+        segment),
+      - node traversal / text occlusion (shape ids + inside length),
+      - label conflicts (other connector or shape + length/area).
+    Use it after connect_shapes / set_connector_route to verify that a lane
+    change actually removed an overlap, or to find the connector ids that
+    need a waypoint."""
+    return await _worker.run(_client.route_diagnostics, page)
 
 
 def main() -> None:

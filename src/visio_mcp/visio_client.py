@@ -18,6 +18,7 @@ import sys
 from typing import Any, Callable, Optional
 
 from . import constants as C
+from . import routing
 from .errors import VisioMcpError, hresult_of, translate_com_error
 from .models import DropSpec, hex_to_rgb_formula
 
@@ -934,6 +935,415 @@ class VisioClient:
         info["pos"] = round(pos, 4) if pos is not None else None
         return info
 
+    # -- route control: geometry, diagnostics, manual routes ------------------
+
+    @staticmethod
+    def _shape_bbox(shape) -> tuple[float, float, float, float]:
+        """(left, bottom, right, top) in page inches."""
+        px = float(shape.CellsU("PinX").ResultIU)
+        py = float(shape.CellsU("PinY").ResultIU)
+        lx = float(shape.CellsU("LocPinX").ResultIU)
+        ly = float(shape.CellsU("LocPinY").ResultIU)
+        w = float(shape.CellsU("Width").ResultIU)
+        h = float(shape.CellsU("Height").ResultIU)
+        return (px - lx, py - ly, px - lx + w, py - ly + h)
+
+    def _connector_polyline(self, shape) -> tuple[list[tuple[float, float]], bool]:
+        """Routed polyline in page inches, or ([Begin, End], False).
+
+        Geometry rows are local coordinates; ``Shape.XYToPage`` applies the
+        shape's angle/flip, so dynamic connectors (angle 0) and rotated
+        manual 1-D routes are both handled. The geometry is accepted only
+        when its first/last vertex lands on Begin/End.
+        """
+        try:
+            begin = (float(shape.CellsU("BeginX").ResultIU),
+                     float(shape.CellsU("BeginY").ResultIU))
+            end = (float(shape.CellsU("EndX").ResultIU),
+                   float(shape.CellsU("EndY").ResultIU))
+        except Exception:
+            return [], False
+        points: list[tuple[float, float]] = []
+        try:
+            section = C.VIS_SECTION_FIRST_COMPONENT
+            for row in range(1, int(shape.RowCount(section))):
+                lx = float(shape.CellsSRC(section, row, C.VIS_GEOM_X).ResultIU)
+                ly = float(shape.CellsSRC(section, row, C.VIS_GEOM_Y).ResultIU)
+                px, py = shape.XYToPage(lx, ly)
+                points.append((float(px), float(py)))
+        except Exception:
+            return [begin, end], False
+        if (len(points) < 2
+                or routing.distance(points[0], begin) > 0.05
+                or routing.distance(points[-1], end) > 0.05):
+            return [begin, end], False
+        return points, True
+
+    def _connector_label_rect(self, shape) -> Optional[tuple[float, float, float, float]]:
+        """Approximate page-space text-block rectangle, or None with no text."""
+        try:
+            if not _clean_text(shape.Text).strip():
+                return None
+            tx = float(shape.CellsU("TxtPinX").ResultIU)
+            ty = float(shape.CellsU("TxtPinY").ResultIU)
+            lx = float(shape.CellsU("TxtLocPinX").ResultIU)
+            ly = float(shape.CellsU("TxtLocPinY").ResultIU)
+            tw = float(shape.CellsU("TxtWidth").ResultIU)
+            th = float(shape.CellsU("TxtHeight").ResultIU)
+            cx, cy = shape.XYToPage(tx - lx + tw / 2.0, ty - ly + th / 2.0)
+            return (float(cx) - tw / 2.0, float(cy) - th / 2.0,
+                    float(cx) + tw / 2.0, float(cy) + th / 2.0)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_manual_connector(shape) -> bool:
+        try:
+            return bool(int(shape.CellsU(f"User.{C.ROUTE_USER_MARKER}").ResultIU))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _mark_manual_connector(shape) -> None:
+        try:
+            shape.AddNamedRow(C.VIS_SECTION_USER, C.ROUTE_USER_MARKER, 0)
+        except Exception:
+            pass  # row already exists on a rebuild
+        try:
+            shape.CellsU(f"User.{C.ROUTE_USER_MARKER}").FormulaU = "1"
+        except Exception:
+            pass
+
+    @staticmethod
+    def _manual_local_formulas(point: tuple[float, float]) -> tuple[str, str]:
+        """Page-anchored local X/Y formulas for a 1-D line geometry vertex.
+
+        The line's local X axis runs Begin -> End, so a page point P maps to
+        localX = dot(P-Begin, End-Begin)/Width and localY = cross(End-Begin,
+        P-Begin)/Width. Written as formulas, the vertex stays at the page
+        point while the glued endpoints move and across save/reopen.
+        """
+        x, y = point
+        fx = (f"(({x:.6f} in-BeginX)*(EndX-BeginX)"
+              f"+({y:.6f} in-BeginY)*(EndY-BeginY))/Width")
+        fy = (f"((EndX-BeginX)*({y:.6f} in-BeginY)"
+              f"-(EndY-BeginY)*({x:.6f} in-BeginX))/Width")
+        return fx, fy
+
+    def _reset_manual_geometry(self, shape) -> None:
+        """Leave only the flag row, the MoveTo vertex and the end vertex."""
+        section = C.VIS_SECTION_FIRST_COMPONENT
+        while int(shape.RowCount(section)) > 3:
+            shape.DeleteRow(section, int(shape.RowCount(section)) - 1)
+        if int(shape.RowCount(section)) < 3:
+            shape.AddRow(section, C.VIS_ROW_LAST, C.VIS_TAG_LINE_TO)
+
+    def _write_manual_geometry(self, shape, points: list[tuple[float, float]]) -> None:
+        """Rewrite a 1-D line's vertices to the page-space route.
+
+        Row 1 is the glued begin vertex, the last row the glued end vertex
+        (X=Width, Y=0); every interior row is a page-anchored formula.
+        """
+        if len(points) < 2:
+            raise VisioMcpError("a manual route needs at least two points")
+        section = C.VIS_SECTION_FIRST_COMPONENT
+        self._reset_manual_geometry(shape)
+        interior = points[1:-1]
+        for _ in interior:
+            shape.AddRow(section, C.VIS_ROW_LAST, C.VIS_TAG_LINE_TO)
+        rows = 2 + len(interior)  # 2 = MoveTo + end
+        for index, point in enumerate(interior):
+            row = 2 + index
+            fx, fy = self._manual_local_formulas(point)
+            shape.CellsSRC(section, row, C.VIS_GEOM_X).FormulaU = fx
+            shape.CellsSRC(section, row, C.VIS_GEOM_Y).FormulaU = fy
+        shape.CellsSRC(section, rows, C.VIS_GEOM_X).FormulaU = "Width"
+        shape.CellsSRC(section, rows, C.VIS_GEOM_Y).FormulaU = "0"
+
+    def _label_page_point(self, points: list[tuple[float, float]], label_pos: float,
+                          label_offset_in: float) -> tuple[float, float]:
+        point, direction = routing.point_at_fraction(points, label_pos)
+        # positive offset = left of travel
+        nx, ny = -direction[1], direction[0]
+        return (point[0] + nx * label_offset_in, point[1] + ny * label_offset_in)
+
+    def _set_label_on_route(self, shape, label_pos: float,
+                            label_offset_in: float, manual: bool) -> None:
+        """Place the native text block along the routed path.
+
+        Uses Visio's POINTALONGPATH(Geometry1.Path, travel, offset): travel
+        is 0..1 along the route, offset is perpendicular inches (positive =
+        left of travel). The label follows later reroutes and persists;
+        ResultIU writes do not (SETATREF would recalculate them).
+        """
+        pos = max(0.0, min(1.0, float(label_pos)))
+        offset = float(label_offset_in)
+        expression = (f"POINTALONGPATH(Geometry1.Path,{pos:.6f},"
+                      f"{offset:.6f} in)")
+        try:
+            shape.CellsU("TxtPinX").FormulaForceU = f"PNTX({expression})"
+            shape.CellsU("TxtPinY").FormulaForceU = f"PNTY({expression})"
+        except Exception:
+            # fallback: anchor the label to an absolute page point
+            points, _ = self._connector_polyline(shape)
+            self._set_label_page_point(
+                shape, self._label_page_point(points, pos, offset), manual
+            )
+            return
+        if manual:
+            shape.CellsU("TxtAngle").FormulaU = "-Angle"
+            shape.CellsU("TxtWidth").FormulaU = "MAX(TEXTWIDTH(TheText),5*Char.Size)"
+            shape.CellsU("TxtHeight").FormulaU = "TEXTHEIGHT(TheText,TxtWidth)"
+            shape.CellsU("TxtLocPinX").FormulaU = "TxtWidth*0.5"
+            shape.CellsU("TxtLocPinY").FormulaU = "TxtHeight*0.5"
+        else:
+            shape.CellsU("TxtAngle").FormulaU = "0 deg"
+
+    def _set_label_page_point(self, shape, point: tuple[float, float],
+                              manual: bool) -> None:
+        """Pin a connector's native text block to an absolute page point."""
+        x, y = point
+        if manual:
+            fx, fy = self._manual_local_formulas(point)
+            shape.CellsU("TxtPinX").FormulaU = fx
+            shape.CellsU("TxtPinY").FormulaU = fy
+            # the line itself is rotated; counter-rotate the text block
+            shape.CellsU("TxtAngle").FormulaU = "-Angle"
+            # size the block to the text, not to the whole line
+            shape.CellsU("TxtWidth").FormulaU = "MAX(TEXTWIDTH(TheText),5*Char.Size)"
+            shape.CellsU("TxtHeight").FormulaU = "TEXTHEIGHT(TheText,TxtWidth)"
+            shape.CellsU("TxtLocPinX").FormulaU = "TxtWidth*0.5"
+            shape.CellsU("TxtLocPinY").FormulaU = "TxtHeight*0.5"
+        else:
+            # dynamic connectors are not rotated: local = page - (Pin-LocPin)
+            shape.CellsU("TxtPinX").FormulaForceU = (
+                f"{x:.6f} in - PinX + LocPinX"
+            )
+            shape.CellsU("TxtPinY").FormulaForceU = (
+                f"{y:.6f} in - PinY + LocPinY"
+            )
+            shape.CellsU("TxtAngle").FormulaU = "0 deg"
+
+    @staticmethod
+    def _validate_waypoints(waypoints) -> Optional[list[tuple[float, float]]]:
+        if waypoints is None:
+            return None
+        if not isinstance(waypoints, (list, tuple)):
+            raise VisioMcpError("waypoints must be a list of [x, y] page points")
+        if len(waypoints) > C.ROUTE_MAX_WAYPOINTS:
+            raise VisioMcpError(
+                f"waypoints accepts at most {C.ROUTE_MAX_WAYPOINTS} points, "
+                f"got {len(waypoints)}"
+            )
+        parsed: list[tuple[float, float]] = []
+        for index, point in enumerate(waypoints):
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise VisioMcpError(
+                    f"waypoints[{index}] must be [x, y] in inches, got {point!r}"
+                )
+            try:
+                x, y = float(point[0]), float(point[1])
+            except (TypeError, ValueError):
+                raise VisioMcpError(
+                    f"waypoints[{index}] must contain numbers, got {point!r}"
+                ) from None
+            if not (abs(x) < 1e7 and abs(y) < 1e7):
+                raise VisioMcpError(f"waypoints[{index}] is not a finite point")
+            parsed.append((x, y))
+        return parsed
+
+    @staticmethod
+    def _validate_label_args(label_pos, label_offset_in, has_text: bool) -> None:
+        if label_pos is None and label_offset_in is None:
+            return
+        if not has_text:
+            raise VisioMcpError(
+                "label_pos/label_offset_in require a label (text) on the connector"
+            )
+        if label_pos is not None and not 0.0 <= float(label_pos) <= 1.0:
+            raise VisioMcpError(
+                f"label_pos must be between 0 and 1, got {label_pos!r}"
+            )
+        if label_offset_in is not None:
+            try:
+                float(label_offset_in)
+            except (TypeError, ValueError):
+                raise VisioMcpError(
+                    f"label_offset_in must be a number, got {label_offset_in!r}"
+                ) from None
+
+    def _create_manual_connector(self, page, shape_from, shape_to, from_side, to_side,
+                                 resolved_from, resolved_to, waypoints, label,
+                                 end_arrow, begin_arrow, line_pattern,
+                                 line_weight_pt, line_color, label_pos,
+                                 label_offset_in, actual: dict) -> Any:
+        """Native 1-D line with a page-anchored polyline; endpoints glued."""
+        begin = routing.side_point(self._shape_bbox(shape_from), from_side,
+                                   resolved_from)
+        end = routing.side_point(self._shape_bbox(shape_to), to_side, resolved_to)
+        conn = page.DrawLine(begin[0], begin[1], end[0], end[1])
+        begin_cell, actual["from"] = self._glue_target(shape_from, from_side,
+                                                       resolved_from)
+        end_cell, actual["to"] = self._glue_target(shape_to, to_side, resolved_to)
+        conn.CellsU("BeginX").GlueTo(begin_cell)
+        conn.CellsU("EndX").GlueTo(end_cell)
+        actual_begin = (float(conn.CellsU("BeginX").ResultIU),
+                        float(conn.CellsU("BeginY").ResultIU))
+        actual_end = (float(conn.CellsU("EndX").ResultIU),
+                      float(conn.CellsU("EndY").ResultIU))
+        points = routing.orthogonal_route(
+            actual_begin, actual_end, from_side, to_side, waypoints or (),
+            C.ROUTE_MANUAL_STUB_IN,
+        )
+        self._write_manual_geometry(conn, points)
+        self._mark_manual_connector(conn)
+        conn.CellsU("EndArrow").FormulaU = str(
+            C.ARROW_FILLED_TRIANGLE if end_arrow else C.ARROW_NONE
+        )
+        conn.CellsU("BeginArrow").FormulaU = str(
+            C.ARROW_FILLED_TRIANGLE if begin_arrow else C.ARROW_NONE
+        )
+        conn.CellsU("LinePattern").ResultIU = C.LINE_PATTERNS[line_pattern]
+        if line_weight_pt is not None:
+            conn.CellsU("LineWeight").FormulaU = f"{line_weight_pt} pt"
+        if line_color is not None:
+            conn.CellsU("LineColor").FormulaU = hex_to_rgb_formula(line_color)
+        if label:
+            conn.Text = label
+            pos = 0.5 if label_pos is None else float(label_pos)
+            offset = 0.0 if label_offset_in is None else float(label_offset_in)
+            self._set_label_on_route(conn, pos, offset, manual=True)
+        return conn
+
+    def route_diagnostics(self, page_name: Optional[str] = None) -> dict:
+        """Read-only routing quality report for one page.
+
+        For every connector: page polyline, length, detour ratio, crossings,
+        collinear overlaps, node traversal and label conflicts. No mutation.
+        """
+        page = self._page(page_name)
+        connectors: dict[int, dict] = {}
+        node_rects: dict[int, tuple[float, float, float, float]] = {}
+        label_rects: dict[int, tuple[float, float, float, float]] = {}
+        for shape in _items(page.Shapes):
+            sid = int(shape.ID)
+            try:
+                is_connector = bool(int(shape.OneD))
+            except Exception:
+                is_connector = False
+            if is_connector:
+                points, geometry_ok = self._connector_polyline(shape)
+                from_id = to_id = None
+                try:
+                    for connect in _items(shape.Connects):
+                        name = str(connect.FromCell.Name)
+                        if name.startswith("Begin"):
+                            from_id = int(connect.ToSheet.ID)
+                        elif name.startswith("End"):
+                            to_id = int(connect.ToSheet.ID)
+                except Exception:
+                    pass
+                connectors[sid] = {
+                    "from_id": from_id,
+                    "to_id": to_id,
+                    "points": points,
+                    "geometry_ok": geometry_ok,
+                    "route_kind": "manual" if self._is_manual_connector(shape) else "auto",
+                }
+                label = self._connector_label_rect(shape)
+                if label is not None:
+                    label_rects[sid] = label
+            else:
+                try:
+                    if shape.ContainerProperties is not None:
+                        continue  # a container is a zone, not an obstacle
+                except Exception:
+                    pass
+                node_rects[sid] = self._shape_bbox(shape)
+        report = routing.diagnose_routes(
+            connectors, node_rects, label_rects,
+            endpoint_eps=C.ROUTE_ENDPOINT_EPS_IN,
+            overlap_min=C.ROUTE_OVERLAP_MIN_IN,
+            inside_min=C.ROUTE_INSIDE_MIN_IN,
+            node_inset=C.ROUTE_NODE_INSET_IN,
+            label_area_min=C.ROUTE_LABEL_AREA_MIN_IN2,
+            detour_ratio=C.ROUTE_DETOUR_RATIO,
+        )
+        items = []
+        for sid, info in connectors.items():
+            data = report["connectors"][sid]
+            items.append({
+                "connector_id": sid,
+                "from_id": info["from_id"],
+                "to_id": info["to_id"],
+                "route_kind": info["route_kind"],
+                "geometry_ok": info["geometry_ok"],
+                "polyline": [[round(x, 3), round(y, 3)] for x, y in info["points"]],
+                "route_length": data["route_length"],
+                "straight_length": data["straight_length"],
+                "detour_ratio": data["detour_ratio"],
+                "crossings": data["crossings"],
+                "overlaps": data["overlaps"],
+                "through_shapes": data["through_shapes"],
+                "label_rect": ([round(v, 3) for v in label_rects[sid]]
+                               if sid in label_rects else None),
+                "label_conflicts": data["label_conflicts"],
+            })
+        sheet = page.PageSheet
+        return {
+            "page": str(page.Name),
+            "page_size_in": [
+                round(float(sheet.CellsU("PageWidth").ResultIU), 3),
+                round(float(sheet.CellsU("PageHeight").ResultIU), 3),
+            ],
+            "connectors": items,
+            "summary": report["summary"],
+        }
+
+    def set_route_options(self, separate_lanes: bool = True,
+                          page_name: Optional[str] = None) -> dict:
+        """Set page-level native connector lane separation.
+
+        LineAdjustFrom=1 (separate all lines) and LineAdjustTo=2 (never
+        overlap lines) make Visio's router keep distinct connectors out of
+        one lane; this removes short merge trunks (0.15 in) and long
+        co-linear overlaps without changing the connector API. The cells are
+        page layout settings and persist in the saved document.
+        """
+        app = self._app()
+        page = self._page(page_name)
+        sheet = page.PageSheet
+
+        def apply():
+            sheet.CellsU("LineAdjustFrom").FormulaU = "1" if separate_lanes else "0"
+            sheet.CellsU("LineAdjustTo").FormulaU = "2" if separate_lanes else "0"
+            return {
+                "line_adjust_from": int(float(
+                    sheet.CellsU("LineAdjustFrom").ResultIU)),
+                "line_adjust_to": int(float(
+                    sheet.CellsU("LineAdjustTo").ResultIU)),
+            }
+
+        scope = self._guard("starting undo scope",
+                            lambda: app.BeginUndoScope("Set route options"))
+        try:
+            values = self._guard("setting page route options", apply)
+            self._guard("closing undo scope",
+                        lambda: app.EndUndoScope(scope, True))
+        except Exception:
+            try:
+                app.EndUndoScope(scope, False)
+            except Exception:
+                pass
+            raise
+        return {
+            "page": str(page.Name),
+            "separate_lanes": bool(separate_lanes),
+            **values,
+            "note": "Visio's router separates different connectors into "
+                    "distinct lanes; manual routes keep exact corridors.",
+        }
+
     def connect_shapes(
         self,
         from_id: int,
@@ -950,6 +1360,9 @@ class VisioClient:
         to_side: str = "auto",
         from_pos: Optional[float] = None,
         to_pos: Optional[float] = None,
+        waypoints: Optional[list] = None,
+        label_pos: Optional[float] = None,
+        label_offset_in: Optional[float] = None,
     ) -> dict:
         if route not in C.CONNECTOR_ROUTES:
             raise VisioMcpError(
@@ -988,6 +1401,20 @@ class VisioClient:
                     f"{C.EDGE_CORNER_EPS} and {1.0 - C.EDGE_CORNER_EPS} "
                     "(e.g. 0.01 or 0.99), or name the adjacent side."
                 )
+        parsed_waypoints = self._validate_waypoints(waypoints)
+        self._validate_label_args(label_pos, label_offset_in, bool(label))
+        if parsed_waypoints is not None:
+            if route != "right_angle":
+                raise VisioMcpError(
+                    "waypoints require route='right_angle' (manual routes are "
+                    "orthogonal polylines), got route=" + repr(route)
+                )
+            if from_side == "auto" or to_side == "auto":
+                raise VisioMcpError(
+                    "waypoints require explicit from_side and to_side "
+                    "(top/bottom/left/right): a manual route has no dynamic "
+                    "glue to choose a side for it."
+                )
         app = self._app()
         page = self._page(page_name)
         shape_from = self._shape_by_id(page, from_id)
@@ -1015,6 +1442,13 @@ class VisioClient:
         actual: dict[str, Optional[float]] = {"from": None, "to": None}
 
         def _connect():
+            if parsed_waypoints is not None:
+                return self._create_manual_connector(
+                    page, shape_from, shape_to, from_side, to_side,
+                    resolved_from, resolved_to, parsed_waypoints, label,
+                    end_arrow, begin_arrow, line_pattern, line_weight_pt,
+                    line_color, label_pos, label_offset_in, actual,
+                )
             conn = page.Drop(app.ConnectorToolDataObject, 0.0, 0.0)
             # 'auto' glues to PinX = dynamic glue: Visio picks the best sides
             # and re-routes as the layout changes. A pinned side glues to that
@@ -1046,6 +1480,10 @@ class VisioClient:
                 conn.CellsU("LineColor").FormulaU = hex_to_rgb_formula(line_color)
             if label:
                 conn.Text = label
+                if label_pos is not None or label_offset_in is not None:
+                    pos = 0.5 if label_pos is None else float(label_pos)
+                    offset = 0.0 if label_offset_in is None else float(label_offset_in)
+                    self._set_label_on_route(conn, pos, offset, manual=False)
             return conn
 
         # One undo scope covers the dropped connector AND any connection point
@@ -1060,15 +1498,213 @@ class VisioClient:
             except Exception:
                 pass
             raise
+        manual = parsed_waypoints is not None
+        applied_label_pos = None
+        applied_label_offset = None
+        if label and (manual or label_pos is not None or label_offset_in is not None):
+            applied_label_pos = 0.5 if label_pos is None else round(float(label_pos), 4)
+            applied_label_offset = (0.0 if label_offset_in is None
+                                    else round(float(label_offset_in), 4))
         return {
             "connector_id": int(conn.ID),
             "from_id": from_id,
             "to_id": to_id,
             "route": route,
+            "route_kind": "manual" if manual else "auto",
             "from_side": from_side,
             "to_side": to_side,
             "from_pos": round(actual["from"], 4) if actual["from"] is not None else None,
             "to_pos": round(actual["to"], 4) if actual["to"] is not None else None,
+            "label_pos": applied_label_pos,
+            "label_offset_in": applied_label_offset,
+        }
+
+    def set_connector_route(
+        self,
+        connector_id: int,
+        waypoints: Optional[list] = None,
+        label_pos: Optional[float] = None,
+        label_offset_in: Optional[float] = None,
+        page_name: Optional[str] = None,
+    ) -> dict:
+        """Re-route an existing connector, or move only its label.
+
+        With ``waypoints``, a dynamic connector is replaced by a native 1-D
+        line carrying a page-anchored polyline (same endpoints, sides,
+        positions, arrows and style); a manual route is rewritten in place.
+        Without ``waypoints`` only the label position is changed.
+        """
+        app = self._app()
+        page = self._page(page_name)
+        conn = self._shape_by_id(page, connector_id)
+        try:
+            is_connector = bool(int(conn.OneD))
+        except Exception:
+            is_connector = False
+        if not is_connector:
+            raise VisioMcpError(
+                f"Shape {connector_id} is not a connector (OneD shape)"
+            )
+        text = _clean_text(conn.Text)
+        self._validate_label_args(label_pos, label_offset_in, bool(text))
+        parsed = self._validate_waypoints(waypoints)
+        if parsed is None and label_pos is None and label_offset_in is None:
+            raise VisioMcpError(
+                "set_connector_route needs waypoints and/or label_pos/"
+                "label_offset_in; nothing would change otherwise"
+            )
+
+        from_id = to_id = None
+        from_end: dict = {}
+        to_end: dict = {}
+        try:
+            for connect in _items(conn.Connects):
+                name = str(connect.FromCell.Name)
+                if name.startswith("Begin"):
+                    from_id = int(connect.ToSheet.ID)
+                    from_end = self._connect_endpoint_info(connect)
+                elif name.startswith("End"):
+                    to_id = int(connect.ToSheet.ID)
+                    to_end = self._connect_endpoint_info(connect)
+        except Exception:
+            pass
+        if from_id is None or to_id is None:
+            raise VisioMcpError(
+                f"Connector {connector_id} is not glued to two shapes; "
+                "get_page_state lists its endpoints."
+            )
+        manual = self._is_manual_connector(conn)
+        old_label_rect = self._connector_label_rect(conn)
+
+        # -- label-only path -------------------------------------------------
+        if parsed is None:
+            points, _ = self._connector_polyline(conn)
+            pos = 0.5 if label_pos is None else float(label_pos)
+            offset = 0.0 if label_offset_in is None else float(label_offset_in)
+            scope = self._guard("starting undo scope",
+                                lambda: app.BeginUndoScope("Set connector route"))
+            try:
+                self._set_label_on_route(conn, pos, offset, manual=manual)
+                self._guard("closing undo scope",
+                            lambda: app.EndUndoScope(scope, True))
+            except Exception:
+                try:
+                    app.EndUndoScope(scope, False)
+                except Exception:
+                    pass
+                raise
+            return {
+                "connector_id": int(conn.ID),
+                "replaced_id": None,
+                "route_kind": "manual" if manual else "auto",
+                "from_id": from_id,
+                "to_id": to_id,
+                "from_side": from_end.get("side"),
+                "to_side": to_end.get("side"),
+                "from_pos": from_end.get("pos"),
+                "to_pos": to_end.get("pos"),
+                "label_pos": round(pos, 4),
+                "label_offset_in": round(offset, 4),
+                "polyline": [[round(x, 3), round(y, 3)] for x, y in points],
+            }
+
+        # -- route path ------------------------------------------------------
+        from_side = from_end.get("side")
+        to_side = to_end.get("side")
+        if (from_end.get("glue") != "static" or to_end.get("glue") != "static"
+                or from_side not in routing.SIDE_NORMALS
+                or to_side not in routing.SIDE_NORMALS):
+            raise VisioMcpError(
+                "set_connector_route requires a connector pinned to explicit "
+                "sides (from_side/to_side). This connector uses dynamic glue; "
+                "connect_shapes(..., from_side=..., to_side=..., waypoints=...) "
+                "creates a route-controlled connector instead."
+            )
+        from_pos = float(from_end.get("pos"))
+        to_pos = float(to_end.get("pos"))
+
+        end_arrow = bool(int(conn.CellsU("EndArrow").ResultIU))
+        begin_arrow = bool(int(conn.CellsU("BeginArrow").ResultIU))
+        pattern = int(conn.CellsU("LinePattern").ResultIU)
+        weight_formula = str(conn.CellsU("LineWeight").FormulaU)
+        color_formula = str(conn.CellsU("LineColor").FormulaU)
+
+        scope = self._guard("starting undo scope",
+                            lambda: app.BeginUndoScope("Set connector route"))
+        replaced_id = None
+        try:
+            if manual:
+                begin = (float(conn.CellsU("BeginX").ResultIU),
+                         float(conn.CellsU("BeginY").ResultIU))
+                end = (float(conn.CellsU("EndX").ResultIU),
+                       float(conn.CellsU("EndY").ResultIU))
+                points = routing.orthogonal_route(
+                    begin, end, from_side, to_side, parsed,
+                    C.ROUTE_MANUAL_STUB_IN,
+                )
+                self._write_manual_geometry(conn, points)
+                self._mark_manual_connector(conn)
+                if text and (label_pos is not None or label_offset_in is not None):
+                    pos = 0.5 if label_pos is None else float(label_pos)
+                    offset = (0.0 if label_offset_in is None
+                              else float(label_offset_in))
+                    self._set_label_on_route(conn, pos, offset, manual=True)
+            else:
+                shape_from = page.Shapes.ItemFromID(from_id)
+                shape_to = page.Shapes.ItemFromID(to_id)
+                actual = {"from": from_pos, "to": to_pos}
+                new = self._create_manual_connector(
+                    page, shape_from, shape_to, from_side, to_side,
+                    from_pos, to_pos, parsed, text or None,
+                    end_arrow, begin_arrow, "solid", None, None,
+                    label_pos, label_offset_in, actual,
+                )
+                try:
+                    new.CellsU("LinePattern").ResultIU = pattern
+                    new.CellsU("LineWeight").FormulaU = weight_formula
+                    new.CellsU("LineColor").FormulaU = color_formula
+                except Exception:
+                    pass
+                if (text and label_pos is None and label_offset_in is None
+                        and old_label_rect is not None):
+                    center = ((old_label_rect[0] + old_label_rect[2]) / 2.0,
+                              (old_label_rect[1] + old_label_rect[3]) / 2.0)
+                    self._set_label_page_point(new, center, manual=True)
+                points, _ = self._connector_polyline(new)
+                replaced_id = int(conn.ID)
+                conn.Delete()
+                conn = new
+            self._guard("closing undo scope",
+                        lambda: app.EndUndoScope(scope, True))
+        except Exception:
+            try:
+                app.EndUndoScope(scope, False)
+            except Exception:
+                pass
+            raise
+
+        points, _ = self._connector_polyline(conn)
+        applied_pos = None
+        applied_offset = None
+        if text:
+            if label_pos is not None or label_offset_in is not None:
+                applied_pos = round(0.5 if label_pos is None else float(label_pos), 4)
+                applied_offset = round(
+                    0.0 if label_offset_in is None else float(label_offset_in), 4
+                )
+        return {
+            "connector_id": int(conn.ID),
+            "replaced_id": replaced_id,
+            "route_kind": "manual",
+            "from_id": from_id,
+            "to_id": to_id,
+            "from_side": from_side,
+            "to_side": to_side,
+            "from_pos": round(from_pos, 4),
+            "to_pos": round(to_pos, 4),
+            "label_pos": applied_pos,
+            "label_offset_in": applied_offset,
+            "polyline": [[round(x, 3), round(y, 3)] for x, y in points],
         }
 
     # -- pages ----------------------------------------------------------------
@@ -1464,6 +2100,9 @@ class VisioClient:
                 info["to_side"] = to_end.get("side")
                 info["to_pos"] = to_end.get("pos")
                 info["to_point"] = to_end.get("point")
+                info["route_kind"] = (
+                    "manual" if self._is_manual_connector(shape) else "auto"
+                )
             shapes.append(info)
         sheet = page.PageSheet
         return {
