@@ -1,5 +1,7 @@
 """Route-controlled connectors, label placement and route diagnostics."""
 
+import math
+
 import pytest
 
 from visio_mcp.errors import VisioMcpError
@@ -28,6 +30,27 @@ def _two_shapes(client, first=(4, 8), second=(6, 4)):
             {"master": "Process", "x": second[0], "y": second[1], "text": "B"},
         ])["shapes"]
     ]
+
+
+def _move_glued_end(shape, x, y):
+    """Move a 1-D line's End like Visio does when the glued node moves.
+
+    The fake does not run Visio's glue solver, so the shape frame (Pin,
+    LocPin, Width, Angle) is recomputed here; the page-anchored geometry
+    formulas then keep their interior vertices while the last vertex follows
+    the new End.
+    """
+    begin_x = float(shape.CellsU("BeginX").ResultIU)
+    begin_y = float(shape.CellsU("BeginY").ResultIU)
+    shape.CellsU("EndX").ResultIU = x
+    shape.CellsU("EndY").ResultIU = y
+    length = math.hypot(x - begin_x, y - begin_y)
+    shape.CellsU("Width").ResultIU = length
+    shape.CellsU("PinX").ResultIU = (begin_x + x) / 2.0
+    shape.CellsU("PinY").ResultIU = (begin_y + y) / 2.0
+    shape.CellsU("LocPinX").ResultIU = length / 2.0
+    shape.CellsU("LocPinY").ResultIU = 0.0
+    shape.CellsU("Angle").ResultIU = math.atan2(y - begin_y, x - begin_x)
 
 
 def test_manual_route_creates_native_1d_line_with_vertices(client, app):
@@ -275,3 +298,200 @@ def test_route_diagnostics_reports_overlap(client):
     lengths = [entry["length_in"]
                for item in report["connectors"] for entry in item["overlaps"]]
     assert lengths and max(lengths) > 1.0
+    # the reported interval is the actual shared stretch, not a whole segment
+    for item in report["connectors"]:
+        for entry in item["overlaps"]:
+            start, end = entry["interval"]
+            assert abs(abs(end[0] - start[0]) + abs(end[1] - start[1])
+                       - entry["length_in"]) < 1e-6
+
+
+# -- restoring Visio's automatic routing -----------------------------------
+
+def test_restore_auto_returns_manual_route_to_a_dynamic_connector(client, app):
+    a, b = _two_shapes(client)
+    manual = client.connect_shapes(
+        a, b, from_side="bottom", to_side="top", waypoints=[[6, 6]],
+        label="keep", line_pattern="dashed", line_weight_pt=2,
+        line_color="#808080",
+    )
+    manual_shape = app.ActivePage.Shapes.ItemFromID(manual["connector_id"])
+    restored = client.set_connector_route(
+        manual["connector_id"], restore_auto=True,
+    )
+    assert restored["restored_auto"] is True
+    assert restored["route_kind"] == "auto"
+    assert restored["replaced_id"] == manual["connector_id"]
+    assert restored["connector_id"] != manual["connector_id"]
+    with pytest.raises(Exception):
+        app.ActivePage.Shapes.ItemFromID(manual["connector_id"])
+
+    shape = app.ActivePage.Shapes.ItemFromID(restored["connector_id"])
+    assert shape.OneD
+    assert not client._is_manual_connector(shape)
+    assert str(shape.Text) == "keep"
+    assert shape.CellsU("EndArrow").ResultIU == 5
+    assert shape.CellsU("LinePattern").ResultIU == 2
+    assert shape.CellsU("LineWeight").FormulaU == "2 pt"
+    assert shape.CellsU("LineColor").FormulaU == "RGB(128,128,128)"
+    assert shape.CellsU("ShapeRouteStyle").ResultIU == 1
+    assert shape.CellsU("ConLineRouteExt").ResultIU == 1
+    state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+    info = state[restored["connector_id"]]
+    assert (info["from_id"], info["to_id"]) == (a, b)
+    assert info["from_glue"] == info["to_glue"] == "static"
+    assert (info["from_side"], info["to_side"]) == ("bottom", "top")
+    assert info["route_kind"] == "auto"
+    assert app.undo_scopes[-1][1] is True
+    report = client.route_diagnostics()
+    assert next(c for c in report["connectors"]
+                if c["connector_id"] == restored["connector_id"])["route_kind"] == "auto"
+    assert manual_shape not in app.ActivePage.shapes
+
+
+def test_restore_auto_preserves_the_original_native_route_style(client, app):
+    a, b = _two_shapes(client)
+    dynamic = client.connect_shapes(
+        a, b, route="curved", from_side="bottom", to_side="top",
+    )
+    converted = client.set_connector_route(
+        dynamic["connector_id"], waypoints=[[6, 6]],
+    )
+    manual = app.ActivePage.Shapes.ItemFromID(converted["connector_id"])
+    assert manual.CellsU("User.VisioMcpRouteStyle").ResultIU == 1
+    assert manual.CellsU("User.VisioMcpRouteExt").ResultIU == 2
+
+    restored = client.set_connector_route(
+        converted["connector_id"], restore_auto=True,
+    )
+    shape = app.ActivePage.Shapes.ItemFromID(restored["connector_id"])
+    assert shape.CellsU("ShapeRouteStyle").ResultIU == 1
+    assert shape.CellsU("ConLineRouteExt").ResultIU == 2  # curved again
+
+
+def test_restore_auto_on_an_automatic_connector_is_a_noop(client):
+    a, b = _two_shapes(client)
+    dynamic = client.connect_shapes(a, b, from_side="bottom", to_side="top")
+    result = client.set_connector_route(
+        dynamic["connector_id"], restore_auto=True,
+    )
+    assert result["connector_id"] == dynamic["connector_id"]
+    assert result["replaced_id"] is None
+    assert result["route_kind"] == "auto"
+    assert result["restored_auto"] is False
+    assert "already" in result["note"]
+
+
+def test_restore_auto_rejects_waypoints(client):
+    a, b = _two_shapes(client)
+    manual = client.connect_shapes(
+        a, b, from_side="bottom", to_side="top", waypoints=[[6, 6]],
+    )
+    with pytest.raises(VisioMcpError, match="cannot be combined"):
+        client.set_connector_route(
+            manual["connector_id"], waypoints=[[7, 5]], restore_auto=True,
+        )
+
+
+def test_conversion_style_failure_rolls_back_and_keeps_the_original(
+        client, app, monkeypatch):
+    a, b = _two_shapes(client)
+    original = client.connect_shapes(
+        a, b, label="keep", from_side="bottom", to_side="top",
+        line_pattern="dashed",
+    )
+    create = client._create_manual_connector
+
+    def create_with_guarded_style(*args, **kwargs):
+        conn = create(*args, **kwargs)
+        conn.CellsU("LinePattern").guarded = True  # style copy must fail
+        return conn
+
+    monkeypatch.setattr(client, "_create_manual_connector",
+                        create_with_guarded_style)
+    with pytest.raises(VisioMcpError, match="LinePattern"):
+        client.set_connector_route(
+            original["connector_id"], waypoints=[[6, 6]],
+        )
+    # the original connector is still there: it is deleted only after a
+    # complete style copy
+    shape = app.ActivePage.Shapes.ItemFromID(original["connector_id"])
+    assert str(shape.Text) == "keep"
+    assert shape.CellsU("LinePattern").ResultIU == 2
+    assert client._is_manual_connector(shape) is False
+    assert app.undo_scopes[-1][1] is False
+
+
+def test_restore_auto_failure_keeps_the_manual_connector(
+        client, app, monkeypatch):
+    a, b = _two_shapes(client)
+    manual = client.connect_shapes(
+        a, b, from_side="bottom", to_side="top", waypoints=[[6, 6]],
+        label="keep", line_pattern="dotted",
+    )
+
+    def boom(source, target):
+        raise VisioMcpError("injected style copy failure")
+
+    monkeypatch.setattr(client, "_copy_connector_style", boom)
+    with pytest.raises(VisioMcpError, match="injected style copy failure"):
+        client.set_connector_route(manual["connector_id"], restore_auto=True)
+    shape = app.ActivePage.Shapes.ItemFromID(manual["connector_id"])
+    assert client._is_manual_connector(shape) is True
+    assert str(shape.Text) == "keep"
+    assert shape.CellsU("LinePattern").ResultIU == 3
+    assert app.undo_scopes[-1][1] is False
+
+
+# -- diagnostics: filtering, readjustment after a node move ----------------
+
+def test_route_diagnostics_can_filter_one_connector(client):
+    a, b = _two_shapes(client)
+    first = client.connect_shapes(
+        a, b, from_side="right", to_side="left", waypoints=[],
+        from_pos=0.5, to_pos=0.5,
+    )
+    second = client.connect_shapes(
+        a, b, from_side="right", to_side="left", waypoints=[],
+        from_pos=0.5, to_pos=0.5,
+    )
+    report = client.route_diagnostics(connector_id=first["connector_id"])
+    assert [c["connector_id"] for c in report["connectors"]] == [
+        first["connector_id"]]
+    assert report["summary"]["filtered_connector_id"] == first["connector_id"]
+    assert report["summary"]["connector_count"] == 1
+    assert report["summary"]["overlap_count"] == 1
+    assert report["connectors"][0]["overlaps"][0]["connector_id"] == \
+        second["connector_id"]
+    with pytest.raises(VisioMcpError, match="not a connector"):
+        client.route_diagnostics(connector_id=999)
+
+
+def test_manual_route_needs_readjust_after_its_node_moves(client, app):
+    a, b = _two_shapes(client)
+    created = client.connect_shapes(
+        a, b, from_side="bottom", to_side="top", waypoints=[[6, 6]],
+    )
+    before = client.route_diagnostics(
+        connector_id=created["connector_id"])["connectors"][0]
+    assert before["orthogonal"] is True
+    assert before["needs_readjust"] is False
+
+    # Visio re-glues EndX/EndY when the target shape moves; the page-anchored
+    # interior vertices stay put, so the final segment turns diagonal.
+    shape = app.ActivePage.Shapes.ItemFromID(created["connector_id"])
+    _move_glued_end(
+        shape,
+        float(shape.CellsU("EndX").ResultIU) + 1.0,
+        float(shape.CellsU("EndY").ResultIU) + 0.75,
+    )
+
+    report = client.route_diagnostics(connector_id=created["connector_id"])
+    item = report["connectors"][0]
+    assert item["needs_readjust"] is True
+    assert item["orthogonal"] is False
+    assert item["non_orthogonal_segments"]
+    assert item["readjust_hint"]
+    assert report["summary"]["manual_needs_readjust_ids"] == [
+        created["connector_id"]]
+    assert report["summary"]["diagnostics_complete"] is True

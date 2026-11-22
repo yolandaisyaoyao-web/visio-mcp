@@ -427,6 +427,11 @@ def analyze_stage(client, page, spec, built, stage):
             "from_id": info["from_id"],
             "to_id": info["to_id"],
             "points": points,
+            "geometry_ok": ok,
+            "route_kind": (
+                "manual" if client._is_manual_connector(
+                    page.Shapes.ItemFromID(cid)) else "auto"
+            ),
         }
     metrics["geometry_fallback_connectors"] = fallback
 

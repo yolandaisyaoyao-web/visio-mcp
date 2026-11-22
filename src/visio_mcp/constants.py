@@ -241,6 +241,10 @@ VIS_SECTION_USER = 242     # visSectionUser
 ROUTE_MANUAL_STUB_IN = 0.25   # perpendicular exit/entry segment
 ROUTE_MAX_WAYPOINTS = 8       # keeps the polyline and the API bounded
 ROUTE_USER_MARKER = "VisioMcpRoute"  # User cell = 1 on manual routes
+# Original routing behaviour, so restore_auto can return a converted
+# connector to the same native route style it had before.
+ROUTE_USER_STYLE = "VisioMcpRouteStyle"  # ShapeRouteStyle value
+ROUTE_USER_EXT = "VisioMcpRouteExt"      # ConLineRouteExt value
 
 # --- Route diagnostics (pure geometry, page inches) -------------------------
 ROUTE_ENDPOINT_EPS_IN = 0.05   # ignore intersections this close to an endpoint
@@ -249,6 +253,7 @@ ROUTE_INSIDE_MIN_IN = 0.05     # segment length inside a node to report
 ROUTE_NODE_INSET_IN = 0.02     # shrink node boxes so hugging an edge is fine
 ROUTE_LABEL_AREA_MIN_IN2 = 0.02  # label/node overlap worth reporting
 ROUTE_DETOUR_RATIO = 2.0       # route length / straight distance
+ROUTE_ORTHO_TOLERANCE_IN = 0.001  # off-axis deviation that breaks a right angle
 
 # How far off an edge a connection point may sit and still count as lying on
 # it. The allowance is a fraction of the edge it is measured against, never

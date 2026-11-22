@@ -49,12 +49,17 @@ mcp = FastMCP(
         "from_pos/to_pos (0..1) to place one exactly. get_page_state reports "
         "each connector end's glue kind, edge, position and point row. "
         "When Visio's router shares a lane or a label collides, call "
-        "route_diagnostics (read-only): it reports the polyline, crossings, "
-        "overlaps, node traversal and label conflicts with ids and points. "
-        "Fix short merge trunks with set_route_options(separate_lanes=True); "
-        "pin exact corridors with connect_shapes(waypoints=...) or "
-        "set_connector_route on an existing connector (native 1-D line, "
-        "endpoints stay glued). Place labels with POINTALONGPATH via "
+        "route_diagnostics (read-only): it reports the polyline, every "
+        "crossing point, every actual overlap interval, node traversal, "
+        "label conflicts and — for route-controlled lines — whether a node "
+        "move made the path non-orthogonal (needs_readjust). Pass "
+        "connector_id to focus the report. Fix short merge trunks with "
+        "set_route_options(separate_lanes=True); pin exact corridors with "
+        "connect_shapes(waypoints=...) or set_connector_route on an existing "
+        "connector (native 1-D line, endpoints stay glued). "
+        "set_connector_route(..., restore_auto=True) returns a fixed route "
+        "to Visio's native automatic routing while keeping its glue, text "
+        "and style. Place labels with POINTALONGPATH via "
         "label_pos/label_offset_in. Dynamic routing remains the default. "
         "For Azure/"
         "AWS icons, Visio ships built-in cloud stencils — visio_status lists "
@@ -427,14 +432,19 @@ async def set_connector_route(
     label_pos: Optional[float] = None,
     label_offset_in: Optional[float] = None,
     page: Optional[str] = None,
+    restore_auto: bool = False,
 ) -> dict:
-    """Change an existing connector's route and/or label position.
+    """Change an existing connector's route and/or label position, or give
+    it back to Visio's automatic router.
 
     With waypoints, a dynamic connector is replaced by a native 1-D
     route-controlled line preserving endpoints, sides, positions, arrows and
     line style; an existing manual route is rewritten in place. Without
     waypoints only the label moves. Pass [] to give a connector a default
-    orthogonal route with no extra bends beyond the side stubs.
+    orthogonal route with no extra bends beyond the side stubs. With
+    restore_auto=True a route-controlled line becomes a native dynamic
+    connector again, glued to the same connection points with the same text,
+    arrows and line style; waypoints cannot be combined with it.
 
     Args:
         connector_id: The connector shape to adjust.
@@ -444,10 +454,14 @@ async def set_connector_route(
         label_pos: Optional 0..1 position along the routed path for the label.
         label_offset_in: Optional perpendicular offset in inches (positive =
             left of travel).
+        restore_auto: Restore Visio's native dynamic routing on a connector
+            created with waypoints. Topology (from/to shapes), static glue
+            points, text, arrows and line style are preserved. An already
+            automatic connector is left unchanged.
     """
     return await _worker.run(
         _client.set_connector_route, connector_id, waypoints,
-        label_pos, label_offset_in, page,
+        label_pos, label_offset_in, page, restore_auto,
     )
 
 
@@ -627,21 +641,33 @@ async def get_page_state(page: Optional[str] = None) -> dict:
 
 @mcp.tool()
 @_tool_errors
-async def route_diagnostics(page: Optional[str] = None) -> dict:
+async def route_diagnostics(
+    page: Optional[str] = None,
+    connector_id: Optional[int] = None,
+) -> dict:
     """Read-only routing quality report for a page. No shapes are changed.
 
     For every connector it returns the actual routed polyline in page inches,
     route length, straight-line length and detour ratio, plus precise
     locations of:
-      - crossings with other connectors (connector ids + page point),
-      - collinear overlaps with other connectors (id + overlap length +
-        segment),
+      - every distinct crossing with another connector (connector ids + page
+        point), including crossings that land on a bend,
+      - every physical collinear-overlap interval with another connector
+        (id + length + the actual shared page-space interval),
       - node traversal / text occlusion (shape ids + inside length),
-      - label conflicts (other connector or shape + length/area).
+      - label conflicts (other connector or shape + length/area),
+      - for route-controlled (manual) lines: whether the path is still
+        orthogonal, the non-orthogonal segments, and needs_readjust when a
+        node move forced the page-anchored path out of a right angle (call
+        set_connector_route again to restore it).
+    The summary marks diagnostics_complete=false and lists
+    geometry_failed_ids when Visio geometry extraction failed and a
+    Begin-End straight fallback was used. Pass connector_id to focus the
+    report on one connector (the summary counts then cover just that one).
     Use it after connect_shapes / set_connector_route to verify that a lane
     change actually removed an overlap, or to find the connector ids that
     need a waypoint."""
-    return await _worker.run(_client.route_diagnostics, page)
+    return await _worker.run(_client.route_diagnostics, page, connector_id)
 
 
 def main() -> None:

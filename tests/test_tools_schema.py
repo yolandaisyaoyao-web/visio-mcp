@@ -113,13 +113,15 @@ async def test_set_connector_route_schema():
     for name in ("waypoints", "label_pos", "label_offset_in", "page"):
         assert name in schema["properties"], name
         assert schema["properties"][name].get("default") is None, name
+    assert schema["properties"]["restore_auto"].get("default") is False
 
 
-async def test_route_diagnostics_takes_optional_page():
+async def test_route_diagnostics_takes_optional_page_and_connector_filter():
     tools = {t.name: t for t in await server.mcp.list_tools()}
     schema = tools["route_diagnostics"].inputSchema
     assert schema.get("required", []) == []
     assert "page" in schema["properties"]
+    assert schema["properties"]["connector_id"].get("default") is None
 
 
 async def test_set_route_options_schema():

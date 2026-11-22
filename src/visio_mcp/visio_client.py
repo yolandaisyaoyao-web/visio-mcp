@@ -1004,15 +1004,117 @@ class VisioClient:
             return False
 
     @staticmethod
-    def _mark_manual_connector(shape) -> None:
+    def _set_user_cell(shape, name: str, value: str) -> None:
+        """Write one User row, adding it when the shape does not have it."""
         try:
-            shape.AddNamedRow(C.VIS_SECTION_USER, C.ROUTE_USER_MARKER, 0)
+            shape.AddNamedRow(C.VIS_SECTION_USER, name, 0)
         except Exception:
             pass  # row already exists on a rebuild
+        shape.CellsU(f"User.{name}").FormulaU = str(value)
+
+    @staticmethod
+    def _get_user_cell(shape, name: str, default: Optional[float] = None):
         try:
-            shape.CellsU(f"User.{C.ROUTE_USER_MARKER}").FormulaU = "1"
+            return float(shape.CellsU(f"User.{name}").ResultIU)
+        except Exception:
+            return default
+
+    @classmethod
+    def _mark_manual_connector(cls, shape) -> None:
+        try:
+            cls._set_user_cell(shape, C.ROUTE_USER_MARKER, "1")
+        except Exception:
+            pass  # the route still works; only diagnostics grouping is affected
+
+    @staticmethod
+    def _cell_formula(cell) -> str:
+        """Formula text of a cell, falling back to its value.
+
+        Real Visio always has a formula; the fallback keeps the duck-typed
+        test fake (which only records ResultIU for some writes) faithful.
+        """
+        formula = str(cell.FormulaU).strip()
+        if formula:
+            return formula
+        return f"{float(cell.ResultIU):g}"
+
+    # Critical cells: if any cannot be copied the conversion must abort and
+    # roll back, never delete a connector whose style would be lost.
+    _STYLE_REQUIRED = ("LinePattern", "LineWeight", "LineColor",
+                       "BeginArrow", "EndArrow")
+    _STYLE_OPTIONAL = ("LineColorTrans", "LineCap", "Rounding",
+                       "BeginArrowSize", "EndArrowSize")
+
+    def _copy_connector_style(self, source, target) -> dict:
+        """Copy native style and text between connector shapes.
+
+        Raises VisioMcpError when a critical cell or the text cannot be
+        copied. Callers run inside an undo scope and delete the source only
+        after this returns, so a failure leaves the original connector in
+        place instead of silently dropping its style.
+        """
+        copied: dict[str, str] = {}
+        for name in self._STYLE_REQUIRED:
+            try:
+                formula = self._cell_formula(source.CellsU(name))
+                target.CellsU(name).FormulaU = formula
+                copied[name] = formula
+            except Exception as exc:
+                raise VisioMcpError(
+                    f"could not preserve connector style cell {name} "
+                    f"({exc}); the original connector was left unchanged"
+                ) from exc
+        for name in self._STYLE_OPTIONAL:
+            try:
+                formula = self._cell_formula(source.CellsU(name))
+                target.CellsU(name).FormulaU = formula
+                copied[name] = formula
+            except Exception:
+                continue
+        try:
+            text = str(source.Text)
+            target.Text = text
+            copied["Text"] = text
+        except Exception as exc:
+            raise VisioMcpError(
+                f"could not preserve the connector text ({exc}); the "
+                "original connector was left unchanged"
+            ) from exc
+        return copied
+
+    @staticmethod
+    def _connector_glue_targets(conn) -> dict[str, Any]:
+        """The cells a connector's BeginX/EndX are glued to, by end name."""
+        targets: dict[str, Any] = {}
+        try:
+            for connect in _items(conn.Connects):
+                name = str(connect.FromCell.Name)
+                if name.startswith("Begin"):
+                    targets["begin"] = connect.ToCell
+                elif name.startswith("End"):
+                    targets["end"] = connect.ToCell
         except Exception:
             pass
+        return targets
+
+    def _connector_ends(self, conn) -> tuple[Optional[int], Optional[int],
+                                             dict, dict]:
+        """(from_id, to_id, from_end, to_end) for a connector's glue rows."""
+        from_id = to_id = None
+        from_end: dict = {}
+        to_end: dict = {}
+        try:
+            for connect in _items(conn.Connects):
+                name = str(connect.FromCell.Name)
+                if name.startswith("Begin"):
+                    from_id = int(connect.ToSheet.ID)
+                    from_end = self._connect_endpoint_info(connect)
+                elif name.startswith("End"):
+                    to_id = int(connect.ToSheet.ID)
+                    to_end = self._connect_endpoint_info(connect)
+        except Exception:
+            pass
+        return from_id, to_id, from_end, to_end
 
     @staticmethod
     def _manual_local_formulas(point: tuple[float, float]) -> tuple[str, str]:
@@ -1176,7 +1278,9 @@ class VisioClient:
                                  resolved_from, resolved_to, waypoints, label,
                                  end_arrow, begin_arrow, line_pattern,
                                  line_weight_pt, line_color, label_pos,
-                                 label_offset_in, actual: dict) -> Any:
+                                 label_offset_in, actual: dict,
+                                 route_style: int = C.ROUTE_RIGHT_ANGLE,
+                                 route_ext: int = C.ROUTE_EXT_STRAIGHT) -> Any:
         """Native 1-D line with a page-anchored polyline; endpoints glued."""
         begin = routing.side_point(self._shape_bbox(shape_from), from_side,
                                    resolved_from)
@@ -1197,6 +1301,13 @@ class VisioClient:
         )
         self._write_manual_geometry(conn, points)
         self._mark_manual_connector(conn)
+        # Remember the routing behaviour the route replaced, so
+        # set_connector_route(..., restore_auto=True) can give it back.
+        try:
+            self._set_user_cell(conn, C.ROUTE_USER_STYLE, str(int(route_style)))
+            self._set_user_cell(conn, C.ROUTE_USER_EXT, str(int(route_ext)))
+        except Exception:
+            pass
         conn.CellsU("EndArrow").FormulaU = str(
             C.ARROW_FILLED_TRIANGLE if end_arrow else C.ARROW_NONE
         )
@@ -1215,11 +1326,15 @@ class VisioClient:
             self._set_label_on_route(conn, pos, offset, manual=True)
         return conn
 
-    def route_diagnostics(self, page_name: Optional[str] = None) -> dict:
+    def route_diagnostics(self, page_name: Optional[str] = None,
+                          connector_id: Optional[int] = None) -> dict:
         """Read-only routing quality report for one page.
 
-        For every connector: page polyline, length, detour ratio, crossings,
-        collinear overlaps, node traversal and label conflicts. No mutation.
+        For every connector: page polyline, length, detour ratio, all
+        crossings, every actual collinear-overlap interval, node traversal,
+        label conflicts, plus (for manual routes) orthogonality and whether
+        a node move left the page-anchored path needing readjustment.
+        ``connector_id`` restricts the report to one connector. No mutation.
         """
         page = self._page(page_name)
         connectors: dict[int, dict] = {}
@@ -1268,9 +1383,20 @@ class VisioClient:
             node_inset=C.ROUTE_NODE_INSET_IN,
             label_area_min=C.ROUTE_LABEL_AREA_MIN_IN2,
             detour_ratio=C.ROUTE_DETOUR_RATIO,
+            ortho_tol=C.ROUTE_ORTHO_TOLERANCE_IN,
         )
+        if connector_id is not None:
+            if connector_id not in connectors:
+                available = sorted(connectors)
+                raise VisioMcpError(
+                    f"Shape {connector_id} is not a connector on page "
+                    f"{page.Name!r}; connectors: {available}"
+                )
+            report = routing.filter_report(report, connector_id)
         items = []
         for sid, info in connectors.items():
+            if connector_id is not None and sid != connector_id:
+                continue
             data = report["connectors"][sid]
             items.append({
                 "connector_id": sid,
@@ -1278,6 +1404,10 @@ class VisioClient:
                 "to_id": info["to_id"],
                 "route_kind": info["route_kind"],
                 "geometry_ok": info["geometry_ok"],
+                "orthogonal": data["orthogonal"],
+                "needs_readjust": data["needs_readjust"],
+                "non_orthogonal_segments": data["non_orthogonal_segments"],
+                "readjust_hint": data["readjust_hint"],
                 "polyline": [[round(x, 3), round(y, 3)] for x, y in info["points"]],
                 "route_length": data["route_length"],
                 "straight_length": data["straight_length"],
@@ -1526,13 +1656,19 @@ class VisioClient:
         label_pos: Optional[float] = None,
         label_offset_in: Optional[float] = None,
         page_name: Optional[str] = None,
+        restore_auto: bool = False,
     ) -> dict:
-        """Re-route an existing connector, or move only its label.
+        """Re-route an existing connector, move only its label, or restore
+        Visio's native automatic routing.
 
         With ``waypoints``, a dynamic connector is replaced by a native 1-D
         line carrying a page-anchored polyline (same endpoints, sides,
         positions, arrows and style); a manual route is rewritten in place.
         Without ``waypoints`` only the label position is changed.
+        ``restore_auto=True`` converts a route-controlled line back into a
+        dynamic connector glued to the same connection points, preserving
+        text, arrows and line style; an already-automatic connector is left
+        alone. Waypoints cannot be combined with ``restore_auto``.
         """
         app = self._app()
         page = self._page(page_name)
@@ -1548,26 +1684,20 @@ class VisioClient:
         text = _clean_text(conn.Text)
         self._validate_label_args(label_pos, label_offset_in, bool(text))
         parsed = self._validate_waypoints(waypoints)
-        if parsed is None and label_pos is None and label_offset_in is None:
+        if restore_auto and parsed is not None:
             raise VisioMcpError(
-                "set_connector_route needs waypoints and/or label_pos/"
-                "label_offset_in; nothing would change otherwise"
+                "restore_auto cannot be combined with waypoints: automatic "
+                "routing lets Visio choose the path. Omit waypoints, or leave "
+                "restore_auto off to pin an explicit route."
+            )
+        if (not restore_auto and parsed is None
+                and label_pos is None and label_offset_in is None):
+            raise VisioMcpError(
+                "set_connector_route needs waypoints, label_pos/"
+                "label_offset_in, or restore_auto; nothing would change otherwise"
             )
 
-        from_id = to_id = None
-        from_end: dict = {}
-        to_end: dict = {}
-        try:
-            for connect in _items(conn.Connects):
-                name = str(connect.FromCell.Name)
-                if name.startswith("Begin"):
-                    from_id = int(connect.ToSheet.ID)
-                    from_end = self._connect_endpoint_info(connect)
-                elif name.startswith("End"):
-                    to_id = int(connect.ToSheet.ID)
-                    to_end = self._connect_endpoint_info(connect)
-        except Exception:
-            pass
+        from_id, to_id, from_end, to_end = self._connector_ends(conn)
         if from_id is None or to_id is None:
             raise VisioMcpError(
                 f"Connector {connector_id} is not glued to two shapes; "
@@ -1575,6 +1705,115 @@ class VisioClient:
             )
         manual = self._is_manual_connector(conn)
         old_label_rect = self._connector_label_rect(conn)
+
+        # -- restore Visio's native automatic routing ------------------------
+        if restore_auto:
+            if not manual:
+                if label_pos is not None or label_offset_in is not None:
+                    pos = 0.5 if label_pos is None else float(label_pos)
+                    offset = (0.0 if label_offset_in is None
+                              else float(label_offset_in))
+                    scope = self._guard(
+                        "starting undo scope",
+                        lambda: app.BeginUndoScope("Set connector route"))
+                    try:
+                        self._set_label_on_route(conn, pos, offset, manual=False)
+                        self._guard("closing undo scope",
+                                    lambda: app.EndUndoScope(scope, True))
+                    except Exception:
+                        try:
+                            app.EndUndoScope(scope, False)
+                        except Exception:
+                            pass
+                        raise
+                points, _ = self._connector_polyline(conn)
+                return {
+                    "connector_id": int(conn.ID),
+                    "replaced_id": None,
+                    "route_kind": "auto",
+                    "restored_auto": False,
+                    "note": "connector already uses Visio's automatic routing",
+                    "from_id": from_id,
+                    "to_id": to_id,
+                    "from_side": from_end.get("side"),
+                    "to_side": to_end.get("side"),
+                    "from_pos": from_end.get("pos"),
+                    "to_pos": to_end.get("pos"),
+                    "label_pos": (round(0.5 if label_pos is None else float(label_pos), 4)
+                                  if (label_pos is not None or label_offset_in is not None)
+                                  else None),
+                    "label_offset_in": (round(0.0 if label_offset_in is None
+                                              else float(label_offset_in), 4)
+                                        if (label_pos is not None or label_offset_in is not None)
+                                        else None),
+                    "polyline": [[round(x, 3), round(y, 3)] for x, y in points],
+                }
+            targets = self._connector_glue_targets(conn)
+            if "begin" not in targets or "end" not in targets:
+                raise VisioMcpError(
+                    f"Connector {connector_id} has no readable glue targets; "
+                    "cannot restore automatic routing without losing its "
+                    "topology. get_page_state lists its endpoints."
+                )
+            route_style = int(self._get_user_cell(
+                conn, C.ROUTE_USER_STYLE, C.ROUTE_RIGHT_ANGLE))
+            route_ext = int(self._get_user_cell(
+                conn, C.ROUTE_USER_EXT, C.ROUTE_EXT_STRAIGHT))
+            replaced_id = int(conn.ID)
+            scope = self._guard(
+                "starting undo scope",
+                lambda: app.BeginUndoScope("Restore automatic routing"))
+            try:
+                new = page.Drop(app.ConnectorToolDataObject, 0.0, 0.0)
+                # the same connection points = the same static glue, sides
+                # and positions the manual route had
+                new.CellsU("BeginX").GlueTo(targets["begin"])
+                new.CellsU("EndX").GlueTo(targets["end"])
+                new.CellsU("ShapeRouteStyle").ResultIU = route_style
+                new.CellsU("ConLineRouteExt").ResultIU = route_ext
+                self._copy_connector_style(conn, new)
+                if text and (label_pos is not None or label_offset_in is not None):
+                    pos = 0.5 if label_pos is None else float(label_pos)
+                    offset = (0.0 if label_offset_in is None
+                              else float(label_offset_in))
+                    self._set_label_on_route(new, pos, offset, manual=False)
+                elif text and old_label_rect is not None:
+                    center = ((old_label_rect[0] + old_label_rect[2]) / 2.0,
+                              (old_label_rect[1] + old_label_rect[3]) / 2.0)
+                    self._set_label_page_point(new, center, manual=False)
+                new_id = int(new.ID)
+                conn.Delete()  # only after every copy above succeeded
+                self._guard("closing undo scope",
+                            lambda: app.EndUndoScope(scope, True))
+            except Exception:
+                try:
+                    app.EndUndoScope(scope, False)
+                except Exception:
+                    pass
+                raise
+            points, _ = self._connector_polyline(new)
+            new_from_id, new_to_id, new_from_end, new_to_end = \
+                self._connector_ends(new)
+            applied_pos = applied_offset = None
+            if text and (label_pos is not None or label_offset_in is not None):
+                applied_pos = round(0.5 if label_pos is None else float(label_pos), 4)
+                applied_offset = round(
+                    0.0 if label_offset_in is None else float(label_offset_in), 4)
+            return {
+                "connector_id": new_id,
+                "replaced_id": replaced_id,
+                "route_kind": "auto",
+                "restored_auto": True,
+                "from_id": new_from_id,
+                "to_id": new_to_id,
+                "from_side": new_from_end.get("side"),
+                "to_side": new_to_end.get("side"),
+                "from_pos": new_from_end.get("pos"),
+                "to_pos": new_to_end.get("pos"),
+                "label_pos": applied_pos,
+                "label_offset_in": applied_offset,
+                "polyline": [[round(x, 3), round(y, 3)] for x, y in points],
+            }
 
         # -- label-only path -------------------------------------------------
         if parsed is None:
@@ -1597,6 +1836,7 @@ class VisioClient:
                 "connector_id": int(conn.ID),
                 "replaced_id": None,
                 "route_kind": "manual" if manual else "auto",
+                "restored_auto": False,
                 "from_id": from_id,
                 "to_id": to_id,
                 "from_side": from_end.get("side"),
@@ -1625,9 +1865,14 @@ class VisioClient:
 
         end_arrow = bool(int(conn.CellsU("EndArrow").ResultIU))
         begin_arrow = bool(int(conn.CellsU("BeginArrow").ResultIU))
-        pattern = int(conn.CellsU("LinePattern").ResultIU)
-        weight_formula = str(conn.CellsU("LineWeight").FormulaU)
-        color_formula = str(conn.CellsU("LineColor").FormulaU)
+        try:
+            route_style = int(float(conn.CellsU("ShapeRouteStyle").ResultIU))
+        except Exception:
+            route_style = C.ROUTE_RIGHT_ANGLE
+        try:
+            route_ext = int(float(conn.CellsU("ConLineRouteExt").ResultIU))
+        except Exception:
+            route_ext = C.ROUTE_EXT_STRAIGHT
 
         scope = self._guard("starting undo scope",
                             lambda: app.BeginUndoScope("Set connector route"))
@@ -1658,13 +1903,12 @@ class VisioClient:
                     from_pos, to_pos, parsed, text or None,
                     end_arrow, begin_arrow, "solid", None, None,
                     label_pos, label_offset_in, actual,
+                    route_style=route_style, route_ext=route_ext,
                 )
-                try:
-                    new.CellsU("LinePattern").ResultIU = pattern
-                    new.CellsU("LineWeight").FormulaU = weight_formula
-                    new.CellsU("LineColor").FormulaU = color_formula
-                except Exception:
-                    pass
+                # Strict: a partial style copy raises and the undo scope
+                # restores the original connector — it is never deleted
+                # while some of its style could not be carried over.
+                self._copy_connector_style(conn, new)
                 if (text and label_pos is None and label_offset_in is None
                         and old_label_rect is not None):
                     center = ((old_label_rect[0] + old_label_rect[2]) / 2.0,
@@ -1672,7 +1916,7 @@ class VisioClient:
                     self._set_label_page_point(new, center, manual=True)
                 points, _ = self._connector_polyline(new)
                 replaced_id = int(conn.ID)
-                conn.Delete()
+                conn.Delete()  # only after every copy above succeeded
                 conn = new
             self._guard("closing undo scope",
                         lambda: app.EndUndoScope(scope, True))
@@ -1696,6 +1940,7 @@ class VisioClient:
             "connector_id": int(conn.ID),
             "replaced_id": replaced_id,
             "route_kind": "manual",
+            "restored_auto": False,
             "from_id": from_id,
             "to_id": to_id,
             "from_side": from_side,

@@ -16,6 +16,11 @@ Uses the round-2 baseline drawings in D:\\桌面\\test\\visio-mcp-regression:
      long routes to distinct corridors, clears the "No" label conflict,
      survives a P6 move and save/reopen, and verifies no new crossings or
      node traversal.
+  E. manual -> automatic -> manual round trip: node-move needs_readjust
+     diagnostics, restore_auto with topology/static glue/text/style
+     preservation, save/reopen, connector_id filtering, and failure
+     injection proving both conversions roll back without deleting the
+     original connector (including created connection points).
 
 Artifacts written next to the baselines (which are copied to baseline/):
   *-route-controlled.vsdx / .png, route-control-data.json.
@@ -33,6 +38,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from visio_mcp.errors import VisioMcpError  # noqa: E402
 from visio_mcp.runtime import ComWorker  # noqa: E402
 from visio_mcp.visio_client import VisioClient  # noqa: E402
 
@@ -53,6 +59,16 @@ def summary(report: dict) -> dict:
             "through_shape_count", "label_conflict_count",
             "flagged_connector_ids", "max_detour_ratio")
     return {key: report["summary"][key] for key in keys}
+
+
+def crossing_counts(report: dict) -> dict:
+    """Number of distinct crossing points per sorted connector pair."""
+    raw: dict[tuple[int, int], int] = {}
+    for item in report["connectors"]:
+        for entry in item["crossings"]:
+            pair = tuple(sorted((item["connector_id"], entry["connector_id"])))
+            raw[pair] = raw.get(pair, 0) + 1
+    return {pair: count // 2 for pair, count in raw.items()}
 
 
 def topology(state: dict) -> list:
@@ -215,6 +231,196 @@ def synthetic_route(client, app):
     app.ActiveDocument.Close()
 
 
+def round_trip_auto(client, app) -> dict:
+    """E: manual -> auto -> manual, readjust diagnostics and rollback."""
+    print("\n[E] automatic <-> fixed routing round trip and rollback")
+    client.create_document(
+        r"C:\Program Files\Microsoft Office\Root\Office16\Visio Content\2052\BASFLO_M.VSTX"
+    )
+    client.open_stencil(
+        r"C:\Program Files\Microsoft Office\Root\Office16\Visio Content\2052\BASFLO_M.VSSX"
+    )
+    ids = [s["shape_id"] for s in client.drop_shapes([
+        {"master": "流程", "x": 4, "y": 8, "text": "A"},
+        {"master": "流程", "x": 4, "y": 4, "text": "B"},
+    ])["shapes"]]
+    a, b = ids
+    manual = client.connect_shapes(
+        a, b, from_side="bottom", to_side="top", waypoints=[[6, 6]],
+        label="往返", line_pattern="dashed", line_weight_pt=2,
+        line_color="#808080",
+    )
+    cid = manual["connector_id"]
+    item = item_by_id(client.route_diagnostics(connector_id=cid), cid)
+    check("往返", "创建后固定路径正交且完整",
+          item["orthogonal"] is True and item["needs_readjust"] is False
+          and item["geometry_ok"] is True,
+          f"orthogonal={item['orthogonal']} ok={item['geometry_ok']}")
+
+    # move the target: page-anchored vertices stay, so the path turns diagonal
+    client.update_shape(b, x=6.5, y=3.5)
+    moved = client.route_diagnostics(connector_id=cid)
+    item = moved["connectors"][0]
+    check("往返", "节点移动后报告 needs_readjust 与非正交段",
+          item["needs_readjust"] is True and item["orthogonal"] is False
+          and bool(item["non_orthogonal_segments"]),
+          f"needs_readjust={item['needs_readjust']}, "
+          f"segments={item['non_orthogonal_segments']}")
+    check("往返", "移动后诊断仍为完整几何（非降级）",
+          moved["summary"]["diagnostics_complete"] is True,
+          f"summary={moved['summary']}")
+
+    path = os.path.join(BASE, "route-control-roundtrip-route-controlled.vsdx")
+    if os.path.exists(path):
+        os.remove(path)
+    client.save_document(path)
+    app.ActiveDocument.Close()
+    client.open_document(path)
+    reopened = client.route_diagnostics(connector_id=cid)
+    item = reopened["connectors"][0]
+    check("往返", "保存重开后 needs_readjust 仍准确",
+          item["needs_readjust"] is True and item["geometry_ok"] is True,
+          f"needs_readjust={item['needs_readjust']} ok={item['geometry_ok']}")
+
+    # re-adjust the fixed route after the move
+    readjusted = client.set_connector_route(cid, waypoints=[[6, 6]])
+    item = item_by_id(client.route_diagnostics(connector_id=cid), cid)
+    check("往返", "重新指定 waypoint 后恢复正交",
+          readjusted["route_kind"] == "manual"
+          and item["orthogonal"] is True and item["needs_readjust"] is False,
+          f"orthogonal={item['orthogonal']}")
+
+    # restore Visio's native automatic routing
+    restored = client.set_connector_route(cid, restore_auto=True)
+    check("往返", "固定路径恢复为原生自动布线",
+          restored["restored_auto"] is True
+          and restored["route_kind"] == "auto"
+          and restored["replaced_id"] == cid
+          and restored["connector_id"] != cid,
+          f"{cid} -> {restored['connector_id']}")
+    state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+    new_id = restored["connector_id"]
+    info = state[new_id]
+    check("往返", "恢复后拓扑与静态粘附点不变",
+          (info["from_id"], info["to_id"]) == (a, b)
+          and info["from_glue"] == info["to_glue"] == "static"
+          and (info["from_side"], info["to_side"]) == ("bottom", "top")
+          and abs(info["from_pos"] - 0.5) < 1e-6
+          and abs(info["to_pos"] - 0.5) < 1e-6,
+          f"{info['from_id']}->{info['to_id']} "
+          f"{info['from_glue']}/{info['to_glue']} "
+          f"{info['from_side']}@{info['from_pos']}/"
+          f"{info['to_side']}@{info['to_pos']}")
+    shape = client._page().Shapes.ItemFromID(new_id)
+    check("往返", "恢复后文字/样式/箭头保持",
+          str(shape.Text) == "往返"
+          and int(shape.CellsU("LinePattern").ResultIU) == 2
+          and str(shape.CellsU("LineWeight").FormulaU) == "2 pt"
+          and int(shape.CellsU("EndArrow").ResultIU) == 5
+          and int(shape.CellsU("BeginArrow").ResultIU) == 0,
+          f"text={str(shape.Text)!r} "
+          f"pattern={shape.CellsU('LinePattern').ResultIU} "
+          f"weight={shape.CellsU('LineWeight').FormulaU}")
+    filtered = client.route_diagnostics(connector_id=new_id)
+    entry = filtered["connectors"][0]
+    check("往返", "按连接线 ID 筛选诊断",
+          len(filtered["connectors"]) == 1
+          and filtered["summary"]["filtered_connector_id"] == new_id
+          and entry["route_kind"] == "auto"
+          and entry["needs_readjust"] is False,
+          f"summary={filtered['summary']}")
+
+    client.save_document()
+    app.ActiveDocument.Close()
+    client.open_document(path)
+    state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+    check("往返", "保存重开后仍为自动布线且静态粘附",
+          new_id in state and state[new_id]["route_kind"] == "auto"
+          and state[new_id]["from_glue"] == state[new_id]["to_glue"] == "static",
+          f"{state.get(new_id)}")
+    shape = client._page().Shapes.ItemFromID(new_id)
+    check("往返", "保存重开后文字与样式保持",
+          str(shape.Text) == "往返"
+          and int(shape.CellsU("LinePattern").ResultIU) == 2,
+          f"text={str(shape.Text)!r} "
+          f"pattern={shape.CellsU('LinePattern').ResultIU}")
+
+    # back to a fixed route
+    back = client.set_connector_route(new_id, waypoints=[[6, 6]])
+    item = item_by_id(client.route_diagnostics(connector_id=back["connector_id"]),
+                      back["connector_id"])
+    check("往返", "再次转换为固定路径并保持样式",
+          back["route_kind"] == "manual"
+          and back["replaced_id"] == new_id
+          and item["orthogonal"] is True
+          and str(client._page().Shapes.ItemFromID(
+              back["connector_id"]).Text) == "往返",
+          f"{new_id} -> {back['connector_id']}")
+
+    # -- failure rollback: restore auto must keep the manual connector ----
+    before_count = int(client._page().Shapes.Count)
+    original_copy = client._copy_connector_style
+
+    def _fail_copy(source, target):
+        raise VisioMcpError("injected style copy failure")
+
+    client._copy_connector_style = _fail_copy
+    raised = False
+    try:
+        client.set_connector_route(back["connector_id"], restore_auto=True)
+    except VisioMcpError as exc:
+        raised = "injected style copy failure" in str(exc)
+    finally:
+        client._copy_connector_style = original_copy
+    state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+    kept = state.get(back["connector_id"])
+    check("往返", "恢复自动布线失败时回滚并保留原连接线",
+          raised and kept is not None and kept["route_kind"] == "manual"
+          and int(client._page().Shapes.Count) == before_count,
+          f"raised={raised}, kept={kept and kept['route_kind']}, "
+          f"shapes {before_count}->{client._page().Shapes.Count}")
+
+    # -- failure rollback: dynamic -> manual must keep the dynamic one ----
+    rollback_dyn = client.connect_shapes(
+        a, b, from_side="right", to_side="right", label="回滚",
+        line_pattern="dotted",
+    )
+    before_count = int(client._page().Shapes.Count)
+    before_points = [int(client._page().Shapes.ItemFromID(sid).RowCount(7))
+                     for sid in (a, b)]
+    client._copy_connector_style = _fail_copy
+    raised = False
+    try:
+        client.set_connector_route(
+            rollback_dyn["connector_id"], waypoints=[[8, 6]],
+        )
+    except VisioMcpError as exc:
+        raised = "injected style copy failure" in str(exc)
+    finally:
+        client._copy_connector_style = original_copy
+    state = {s["shape_id"]: s for s in client.get_page_state()["shapes"]}
+    kept = state.get(rollback_dyn["connector_id"])
+    after_points = [int(client._page().Shapes.ItemFromID(sid).RowCount(7))
+                    for sid in (a, b)]
+    check("往返", "转换失败时回滚并保留原动态连接线",
+          raised and kept is not None and kept["route_kind"] == "auto"
+          and int(client._page().Shapes.Count) == before_count,
+          f"raised={raised}, kept={kept and kept['route_kind']}, "
+          f"shapes {before_count}->{client._page().Shapes.Count}")
+    check("往返", "转换失败回滚同时撤销新建的连接点",
+          after_points == before_points,
+          f"connection point rows {before_points}->{after_points}")
+    client.export_page_png(
+        os.path.join(BASE, "route-control-roundtrip-route-controlled.png"))
+    app.ActiveDocument.Close()
+    return {
+        "manual_id": cid,
+        "restored_id": new_id,
+        "final_manual_id": back["connector_id"],
+        "rollback_connector_id": rollback_dyn["connector_id"],
+    }
+
+
 def controlled_page(client, app, key: str) -> dict:
     """C: apply native lane separation to a B/C baseline and save a copy."""
     print(f"\n[C] {key}: native lane separation")
@@ -232,15 +438,24 @@ def controlled_page(client, app, key: str) -> dict:
     after = client.route_diagnostics()
     state_after = client.get_page_state()
     print("  after: ", summary(after))
+    before_crossings = crossing_counts(before)
+    after_crossings = crossing_counts(after)
+    increased = {
+        pair: (before_crossings.get(pair, 0), count)
+        for pair, count in after_crossings.items()
+        if count > before_crossings.get(pair, 0)
+    }
     check(key, "短距离共线重叠清零",
           after["summary"]["overlap_count"] == 0,
           f"before={before['summary']['overlap_count']} "
           f"after={after['summary']['overlap_count']}")
     check(key, "无新增交叉/穿节点/标签冲突",
-          after["summary"]["crossing_count"] == 0
+          not increased
           and after["summary"]["through_shape_count"] == 0
           and after["summary"]["label_conflict_count"] == 0,
-          str(summary(after)))
+          f"new_crossing_pairs={increased}, "
+          f"crossings by pair before={before_crossings} "
+          f"after={after_crossings}")
     check(key, "拓扑不变",
           topology(state_after) == topo_before,
           f"{len(topo_before)} connectors")
@@ -255,12 +470,13 @@ def controlled_page(client, app, key: str) -> dict:
     app.ActiveDocument.Close()
     client.open_document(out)
     reopened = client.route_diagnostics()
-    check(key, "保存重开后仍无告警",
+    check(key, "保存重开后布线状态保持（无新增告警）",
           reopened["summary"]["overlap_count"] == 0
-          and reopened["summary"]["crossing_count"] == 0
+          and crossing_counts(reopened) == after_crossings
           and reopened["summary"]["through_shape_count"] == 0
           and reopened["summary"]["label_conflict_count"] == 0,
-          str(summary(reopened)))
+          f"crossings by pair after={after_crossings} "
+          f"reopened={crossing_counts(reopened)}, {summary(reopened)}")
     sheet = client._page().PageSheet
     check(key, "页面分道设置已持久化",
           int(sheet.CellsU("LineAdjustFrom").ResultIU) == 1
@@ -412,6 +628,7 @@ def run(client: VisioClient) -> dict:
     payload = {"out_dir": BASE, "checks": checks, "diagrams": {}}
     try:
         synthetic_route(client, app)
+        payload["diagrams"]["round_trip"] = round_trip_auto(client, app)
         for key in ("B_decisions_merge", "C_multiple_loops"):
             payload["diagrams"][key] = controlled_page(client, app, key)
         payload["diagrams"]["D_tdma_reproduction"] = tdma_controlled(client, app)
