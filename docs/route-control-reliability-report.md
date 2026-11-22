@@ -72,9 +72,10 @@ C 的 `(5.187, 6.7)`、D 的 `(10.213, 4.5)`）：这些点在旧实现中因距
 
 ## 产物
 
-- `D:\桌面\test\visio-mcp-regression\route-control-data.json`
-- `route-control-roundtrip-route-controlled.vsdx/.png`
+- 本仓库证据：`docs/evidence/route-control-data.json`（54 项验收明细）、
+  `docs/evidence/regression-summary.json`（58/58 功能检查，53/72 质量观察项汇总）。
+- `D:\桌面\test\visio-mcp-regression\route-control-roundtrip-route-controlled.vsdx/.png`
 - `B_decisions_merge-route-controlled.vsdx/.png`
 - `C_multiple_loops-route-controlled.vsdx/.png`
 - `D_tdma_reproduction-route-controlled.vsdx/.png`
-- `regression-data.json`（综合回归）
+- `regression-data.json`（综合回归完整数据）

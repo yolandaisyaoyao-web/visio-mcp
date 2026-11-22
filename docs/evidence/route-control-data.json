@@ -1,0 +1,478 @@
+{
+  "out_dir": "D:\\桌面\\test\\visio-mcp-regression",
+  "checks": [
+    {
+      "area": "手动路由",
+      "item": "创建为原生 1-D 路由",
+      "ok": true,
+      "detail": "{'connector_id': 3, 'from_id': 1, 'to_id': 2, 'route': 'right_angle', 'route_kind': 'manual', 'from_side': 'bottom', 'to_side': 'top', 'from_pos': 0.5, 'to_pos': 0.5, 'label_pos': 0.4, 'label_offset_in': 0.2}"
+    },
+    {
+      "area": "手动路由",
+      "item": "端点静态粘附且侧别正确",
+      "ok": true,
+      "detail": "static/static bottom/top"
+    },
+    {
+      "area": "手动路由",
+      "item": "折线可读且经过两个 waypoint",
+      "ok": true,
+      "detail": "[[4.0, 7.705], [4.0, 7.455], [5.0, 7.455], [5.0, 7.0], [7.0, 7.0], [7.0, 6.0], [6.0, 6.0], [6.0, 4.295]]"
+    },
+    {
+      "area": "手动路由",
+      "item": "初始无交叉/重叠/穿节点/标签冲突",
+      "ok": true,
+      "detail": "cross=[] overlap=[] through=[] label=[]"
+    },
+    {
+      "area": "手动路由",
+      "item": "移动节点后 waypoint 仍固定在页面坐标",
+      "ok": true,
+      "detail": "[[4.0, 7.705], [4.0, 7.455], [5.0, 7.455], [5.0, 7.0], [7.0, 7.0], [7.0, 6.0], [6.0, 6.0], [7.0, 3.795]]"
+    },
+    {
+      "area": "手动路由",
+      "item": "移动后拓扑与静态粘附保持",
+      "ok": true,
+      "detail": "1->2 bottom/top"
+    },
+    {
+      "area": "手动路由",
+      "item": "移动后箭头方向正确",
+      "ok": true,
+      "detail": "route_kind=manual"
+    },
+    {
+      "area": "手动路由",
+      "item": "保存重开后 waypoint 与折线保持",
+      "ok": true,
+      "detail": "[[4.0, 7.705], [4.0, 7.455], [5.0, 7.455], [5.0, 7.0], [7.0, 7.0], [7.0, 6.0], [6.0, 6.0], [7.0, 3.795]]"
+    },
+    {
+      "area": "手动路由",
+      "item": "保存重开后标签矩形存在",
+      "ok": true,
+      "detail": "[6.268, 7.098, 6.823, 7.302]"
+    },
+    {
+      "area": "转换",
+      "item": "动态连接线被替换为手动路由",
+      "ok": true,
+      "detail": "3 -> 4"
+    },
+    {
+      "area": "转换",
+      "item": "样式/文字/箭头保持",
+      "ok": true,
+      "detail": "pattern=2.0 text='动态' weight=2 pt"
+    },
+    {
+      "area": "转换",
+      "item": "标签使用 POINTALONGPATH",
+      "ok": true,
+      "detail": "PNTX(POINTALONGPATH(Geometry1.Path,0.5,0.2 in))"
+    },
+    {
+      "area": "转换",
+      "item": "转换后无布线告警",
+      "ok": true,
+      "detail": "cross=[] overlap=[] through=[] label=[]"
+    },
+    {
+      "area": "往返",
+      "item": "创建后固定路径正交且完整",
+      "ok": true,
+      "detail": "orthogonal=True ok=True"
+    },
+    {
+      "area": "往返",
+      "item": "节点移动后报告 needs_readjust 与非正交段",
+      "ok": true,
+      "detail": "needs_readjust=True, segments=[{'index': 4, 'from': [4.0, 6.0], 'to': [6.5, 3.795], 'deviation_in': 2.205}]"
+    },
+    {
+      "area": "往返",
+      "item": "移动后诊断仍为完整几何（非降级）",
+      "ok": true,
+      "detail": "summary={'connector_count': 1, 'crossing_count': 0, 'overlap_count': 0, 'overlap_interval_count': 0, 'through_shape_count': 0, 'label_conflict_count': 0, 'detour_count': 0, 'flagged_connector_ids': [3], 'max_detour_ratio': 1.948, 'detour_ratio_threshold': 2.0, 'geometry_failed_ids': [], 'diagnostics_complete': True, 'manual_needs_readjust_ids': [3], 'manual_needs_readjust_count': 1, 'orthogonal_tolerance_in': 0.001, 'note': None, 'filtered_connector_id': 3}"
+    },
+    {
+      "area": "往返",
+      "item": "保存重开后 needs_readjust 仍准确",
+      "ok": true,
+      "detail": "needs_readjust=True ok=True"
+    },
+    {
+      "area": "往返",
+      "item": "重新指定 waypoint 后恢复正交",
+      "ok": true,
+      "detail": "orthogonal=True"
+    },
+    {
+      "area": "往返",
+      "item": "固定路径恢复为原生自动布线",
+      "ok": true,
+      "detail": "3 -> 4"
+    },
+    {
+      "area": "往返",
+      "item": "恢复后拓扑与静态粘附点不变",
+      "ok": true,
+      "detail": "1->2 static/static bottom@0.5/top@0.5"
+    },
+    {
+      "area": "往返",
+      "item": "恢复后文字/样式/箭头保持",
+      "ok": true,
+      "detail": "text='往返' pattern=2.0 weight=2 pt"
+    },
+    {
+      "area": "往返",
+      "item": "按连接线 ID 筛选诊断",
+      "ok": true,
+      "detail": "summary={'connector_count': 1, 'crossing_count': 0, 'overlap_count': 0, 'overlap_interval_count': 0, 'through_shape_count': 0, 'label_conflict_count': 0, 'detour_count': 0, 'flagged_connector_ids': [], 'max_detour_ratio': 1.381, 'detour_ratio_threshold': 2.0, 'geometry_failed_ids': [], 'diagnostics_complete': True, 'manual_needs_readjust_ids': [], 'manual_needs_readjust_count': 0, 'orthogonal_tolerance_in': 0.001, 'note': None, 'filtered_connector_id': 4}"
+    },
+    {
+      "area": "往返",
+      "item": "保存重开后仍为自动布线且静态粘附",
+      "ok": true,
+      "detail": "{'shape_id': 4, 'name': 'Dynamic connector', 'x': 5.25, 'y': 5.75, 'width_in': 2.5, 'height_in': -3.9094, 'text': '往返', 'master': 'Dynamic connector', 'is_connector': True, 'container_ids': [], 'is_container': False, 'from_id': 1, 'to_id': 2, 'from_glue': 'static', 'from_side': 'bottom', 'from_pos': 0.5, 'from_point': 3, 'to_glue': 'static', 'to_side': 'top', 'to_pos': 0.5, 'to_point': 4, 'route_kind': 'auto'}"
+    },
+    {
+      "area": "往返",
+      "item": "保存重开后文字与样式保持",
+      "ok": true,
+      "detail": "text='往返' pattern=2.0"
+    },
+    {
+      "area": "往返",
+      "item": "再次转换为固定路径并保持样式",
+      "ok": true,
+      "detail": "4 -> 5"
+    },
+    {
+      "area": "往返",
+      "item": "恢复自动布线失败时回滚并保留原连接线",
+      "ok": true,
+      "detail": "raised=True, kept=manual, shapes 3->3"
+    },
+    {
+      "area": "往返",
+      "item": "转换失败时回滚并保留原动态连接线",
+      "ok": true,
+      "detail": "raised=True, kept=auto, shapes 4->4"
+    },
+    {
+      "area": "往返",
+      "item": "转换失败回滚同时撤销新建的连接点",
+      "ok": true,
+      "detail": "connection point rows [4, 4]->[4, 4]"
+    },
+    {
+      "area": "B_decisions_merge",
+      "item": "短距离共线重叠清零",
+      "ok": true,
+      "detail": "before=1 after=0"
+    },
+    {
+      "area": "B_decisions_merge",
+      "item": "无新增交叉/穿节点/标签冲突",
+      "ok": true,
+      "detail": "new_crossing_pairs={}, crossings by pair before={(16, 17): 2} after={(16, 17): 1}"
+    },
+    {
+      "area": "B_decisions_merge",
+      "item": "拓扑不变",
+      "ok": true,
+      "detail": "9 connectors"
+    },
+    {
+      "area": "B_decisions_merge",
+      "item": "节点位置不变",
+      "ok": true,
+      "detail": "no shape moved"
+    },
+    {
+      "area": "B_decisions_merge",
+      "item": "保存重开后布线状态保持（无新增告警）",
+      "ok": true,
+      "detail": "crossings by pair after={(16, 17): 1} reopened={(16, 17): 1}, {'connector_count': 9, 'crossing_count': 1, 'overlap_count': 0, 'through_shape_count': 0, 'label_conflict_count': 0, 'flagged_connector_ids': [16, 17], 'max_detour_ratio': 1.414}"
+    },
+    {
+      "area": "B_decisions_merge",
+      "item": "页面分道设置已持久化",
+      "ok": true,
+      "detail": "LineAdjustFrom=1.0, LineAdjustTo=2.0"
+    },
+    {
+      "area": "C_multiple_loops",
+      "item": "短距离共线重叠清零",
+      "ok": true,
+      "detail": "before=1 after=0"
+    },
+    {
+      "area": "C_multiple_loops",
+      "item": "无新增交叉/穿节点/标签冲突",
+      "ok": true,
+      "detail": "new_crossing_pairs={}, crossings by pair before={(14, 16): 1, (19, 20): 2} after={(14, 16): 1, (19, 20): 1}"
+    },
+    {
+      "area": "C_multiple_loops",
+      "item": "拓扑不变",
+      "ok": true,
+      "detail": "11 connectors"
+    },
+    {
+      "area": "C_multiple_loops",
+      "item": "节点位置不变",
+      "ok": true,
+      "detail": "no shape moved"
+    },
+    {
+      "area": "C_multiple_loops",
+      "item": "保存重开后布线状态保持（无新增告警）",
+      "ok": true,
+      "detail": "crossings by pair after={(14, 16): 1, (19, 20): 1} reopened={(14, 16): 1, (19, 20): 1}, {'connector_count': 11, 'crossing_count': 2, 'overlap_count': 0, 'through_shape_count': 0, 'label_conflict_count': 0, 'flagged_connector_ids': [14, 16, 19, 20], 'max_detour_ratio': 1.571}"
+    },
+    {
+      "area": "C_multiple_loops",
+      "item": "页面分道设置已持久化",
+      "ok": true,
+      "detail": "LineAdjustFrom=1.0, LineAdjustTo=2.0"
+    },
+    {
+      "area": "TDMA",
+      "item": "基线存在 6.5 in 长距离并线",
+      "ok": true,
+      "detail": "[(25, [{'connector_id': 32, 'length_in': 6.5, 'interval': [[10.213, 4.5], [10.213, 11.0]], 'segment': [[10.213, 4.5], [10.213, 11.0]]}], []), (32, [{'connector_id': 25, 'length_in': 6.5, 'interval': [[10.213, 4.5], [10.213, 11.0]], 'segment': [[10.213, 4.5], [10.213, 11.0]]}], [{'kind': 'connector', 'id': 25, 'length_in': 0.259}])]"
+    },
+    {
+      "area": "TDMA",
+      "item": "页面分道消除 6.5 in 并线",
+      "ok": true,
+      "detail": "{'connector_count': 17, 'crossing_count': 0, 'overlap_count': 0, 'through_shape_count': 0, 'label_conflict_count': 2, 'flagged_connector_ids': [32], 'max_detour_ratio': 1.51}"
+    },
+    {
+      "area": "TDMA",
+      "item": "标签位置控制消除“否”标签冲突",
+      "ok": true,
+      "detail": "label_pos=0.8, offset=-0.25, summary={'connector_count': 17, 'crossing_count': 0, 'overlap_count': 0, 'through_shape_count': 0, 'label_conflict_count': 0, 'flagged_connector_ids': [], 'max_detour_ratio': 1.51}"
+    },
+    {
+      "area": "TDMA",
+      "item": "手动走廊后全量布线告警清零",
+      "ok": true,
+      "detail": "{'connector_count': 17, 'crossing_count': 0, 'overlap_count': 0, 'through_shape_count': 0, 'label_conflict_count': 0, 'flagged_connector_ids': [], 'max_detour_ratio': 1.494}"
+    },
+    {
+      "area": "TDMA",
+      "item": "拓扑仍为 17 条连接线且起止对不变",
+      "ok": true,
+      "detail": "17 connectors"
+    },
+    {
+      "area": "TDMA",
+      "item": "页面分道未移动节点",
+      "ok": true,
+      "detail": "no shape moved"
+    },
+    {
+      "area": "TDMA",
+      "item": "长连接固定在不同走廊",
+      "ok": true,
+      "detail": "25 lane=[4.0, 8.0, 11.0], 32 lane=[10.0, 10.508]"
+    },
+    {
+      "area": "TDMA",
+      "item": "手动路由箭头/粘附正确",
+      "ok": true,
+      "detail": "25=manual 32=manual"
+    },
+    {
+      "area": "TDMA",
+      "item": "手动路由端点静态粘附",
+      "ok": true,
+      "detail": "25 bottom/top, 32 left/left"
+    },
+    {
+      "area": "TDMA",
+      "item": "移动 P6 后走廊不跳变",
+      "ok": true,
+      "detail": "25=[4.0, 8.0, 11.0], 32=[10.0, 10.508]"
+    },
+    {
+      "area": "TDMA",
+      "item": "移动 P6 后仍无新交叉/穿节点",
+      "ok": true,
+      "detail": "{'connector_count': 17, 'crossing_count': 0, 'overlap_count': 0, 'through_shape_count': 0, 'label_conflict_count': 0, 'flagged_connector_ids': [], 'max_detour_ratio': 1.494}"
+    },
+    {
+      "area": "TDMA",
+      "item": "保存重开后仍无告警",
+      "ok": true,
+      "detail": "{'connector_count': 17, 'crossing_count': 0, 'overlap_count': 0, 'through_shape_count': 0, 'label_conflict_count': 0, 'flagged_connector_ids': [], 'max_detour_ratio': 1.494}"
+    },
+    {
+      "area": "TDMA",
+      "item": "保存重开后拓扑不变",
+      "ok": true,
+      "detail": "17 connectors"
+    },
+    {
+      "area": "TDMA",
+      "item": "分道设置与手动路由持久化",
+      "ok": true,
+      "detail": "LineAdjustFrom=1, LineAdjustTo=2"
+    }
+  ],
+  "diagrams": {
+    "round_trip": {
+      "manual_id": 3,
+      "restored_id": 4,
+      "final_manual_id": 5,
+      "rollback_connector_id": 7
+    },
+    "B_decisions_merge": {
+      "key": "B_decisions_merge",
+      "before": {
+        "connector_count": 9,
+        "crossing_count": 2,
+        "overlap_count": 1,
+        "through_shape_count": 0,
+        "label_conflict_count": 0,
+        "flagged_connector_ids": [
+          16,
+          17
+        ],
+        "max_detour_ratio": 1.414
+      },
+      "after": {
+        "connector_count": 9,
+        "crossing_count": 1,
+        "overlap_count": 0,
+        "through_shape_count": 0,
+        "label_conflict_count": 0,
+        "flagged_connector_ids": [
+          16,
+          17
+        ],
+        "max_detour_ratio": 1.414
+      },
+      "options": {
+        "page": "页-1",
+        "separate_lanes": true,
+        "line_adjust_from": 1,
+        "line_adjust_to": 2,
+        "note": "Visio's router separates different connectors into distinct lanes; manual routes keep exact corridors."
+      }
+    },
+    "C_multiple_loops": {
+      "key": "C_multiple_loops",
+      "before": {
+        "connector_count": 11,
+        "crossing_count": 3,
+        "overlap_count": 1,
+        "through_shape_count": 0,
+        "label_conflict_count": 0,
+        "flagged_connector_ids": [
+          14,
+          16,
+          19,
+          20
+        ],
+        "max_detour_ratio": 1.571
+      },
+      "after": {
+        "connector_count": 11,
+        "crossing_count": 2,
+        "overlap_count": 0,
+        "through_shape_count": 0,
+        "label_conflict_count": 0,
+        "flagged_connector_ids": [
+          14,
+          16,
+          19,
+          20
+        ],
+        "max_detour_ratio": 1.571
+      },
+      "options": {
+        "page": "页-1",
+        "separate_lanes": true,
+        "line_adjust_from": 1,
+        "line_adjust_to": 2,
+        "note": "Visio's router separates different connectors into distinct lanes; manual routes keep exact corridors."
+      }
+    },
+    "D_tdma_reproduction": {
+      "before": {
+        "connector_count": 17,
+        "crossing_count": 2,
+        "overlap_count": 1,
+        "through_shape_count": 0,
+        "label_conflict_count": 1,
+        "flagged_connector_ids": [
+          25,
+          32
+        ],
+        "max_detour_ratio": 1.51
+      },
+      "after_page_options": {
+        "connector_count": 17,
+        "crossing_count": 0,
+        "overlap_count": 0,
+        "through_shape_count": 0,
+        "label_conflict_count": 2,
+        "flagged_connector_ids": [
+          32
+        ],
+        "max_detour_ratio": 1.51
+      },
+      "after_label_only": {
+        "connector_count": 17,
+        "crossing_count": 0,
+        "overlap_count": 0,
+        "through_shape_count": 0,
+        "label_conflict_count": 0,
+        "flagged_connector_ids": [],
+        "max_detour_ratio": 1.51
+      },
+      "after_manual": {
+        "connector_count": 17,
+        "crossing_count": 0,
+        "overlap_count": 0,
+        "through_shape_count": 0,
+        "label_conflict_count": 0,
+        "flagged_connector_ids": [],
+        "max_detour_ratio": 1.494
+      },
+      "reopened": {
+        "connector_count": 17,
+        "crossing_count": 0,
+        "overlap_count": 0,
+        "through_shape_count": 0,
+        "label_conflict_count": 0,
+        "flagged_connector_ids": [],
+        "max_detour_ratio": 1.494
+      },
+      "moved_p6": {
+        "connector_count": 17,
+        "crossing_count": 0,
+        "overlap_count": 0,
+        "through_shape_count": 0,
+        "label_conflict_count": 0,
+        "flagged_connector_ids": [],
+        "max_detour_ratio": 1.494
+      },
+      "manual_connector_ids": [
+        34,
+        35
+      ],
+      "replaced_ids": [
+        25,
+        32
+      ]
+    }
+  }
+}
